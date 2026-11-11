@@ -168,6 +168,48 @@ class DatabaseManager:
                     created_at TIMESTAMP NOT NULL
                 );
             """)
+
+            # 8. 企业生存与违约事件历史队列表 (用于 Cox 比例风险与生存分析模型)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS company_distress_cohort (
+                    company_id VARCHAR PRIMARY KEY,
+                    company_name VARCHAR NOT NULL,
+                    industry_sector VARCHAR NOT NULL,
+                    duration_months DOUBLE NOT NULL,
+                    is_distressed INTEGER NOT NULL,
+                    distress_type VARCHAR NOT NULL,
+                    event_date DATE,
+                    published_at TIMESTAMP NOT NULL,
+                    cash_burn_months DOUBLE NOT NULL,
+                    debt_ratio DOUBLE NOT NULL,
+                    gross_margin DOUBLE NOT NULL,
+                    competitor_count DOUBLE NOT NULL,
+                    official_announcement_id VARCHAR,
+                    source_url VARCHAR,
+                    quality_status VARCHAR NOT NULL
+                );
+            """)
+
+            # 9. 历史真实前瞻技术训练特征与标签表 (用于 LightGBM 真实监督学习)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tech_training_samples (
+                    sample_id VARCHAR PRIMARY KEY,
+                    topic_id VARCHAR NOT NULL,
+                    base_date DATE NOT NULL,
+                    published_at TIMESTAMP NOT NULL,
+                    velocity_1y DOUBLE NOT NULL,
+                    acceleration DOUBLE NOT NULL,
+                    active_institutions DOUBLE NOT NULL,
+                    github_momentum DOUBLE NOT NULL,
+                    macro_multiplier DOUBLE NOT NULL,
+                    entropy_score DOUBLE NOT NULL,
+                    novelty_score DOUBLE NOT NULL,
+                    target_1y DOUBLE NOT NULL,
+                    target_3y DOUBLE NOT NULL,
+                    target_5y DOUBLE NOT NULL,
+                    quality_status VARCHAR NOT NULL
+                );
+            """)
         finally:
             conn.close()
 

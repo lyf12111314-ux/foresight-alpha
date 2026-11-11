@@ -94,3 +94,45 @@
 | `is_verified_forecast`| BOOLEAN | 是否为经过核验的正式预测 (默认 FALSE) |
 | `scenarios_json`| JSON | 悲观/基准/乐观三情景分布 |
 | `drivers_json` | JSON | 特征重要性敏感度归因 |
+
+---
+
+### 6. `company_distress_cohort` (企业生存与真实违约事件历史队列表)
+| 字段名 | 类型 | 说明 | 示例 |
+| :--- | :--- | :--- | :--- |
+| `company_id` | VARCHAR | 企业唯一股票代码与交易所后缀 | `300104_SZ` |
+| `company_name` | VARCHAR | 企业法定简称 | `乐视网` |
+| `industry_sector` | VARCHAR | 产业赛道分类 | `INTERNET_PLATFORM` |
+| `duration_months` | DOUBLE | 存续月数 (上市或设立至违约/截断) | `118.0` |
+| `is_distressed` | INTEGER | 是否发生终结性违约事件 (1=违约/退市/重整, 0=右删失正常存续) | `1` |
+| `distress_type` | VARCHAR | 违约/存续具体类型 | `MAJOR_FINANCIAL_FRAUD_DELISTING` |
+| `event_date` | DATE | 违约或司法重整受理发生日期 | `2020-05-14` |
+| `published_at` | TIMESTAMP | 官方裁定或终止上市公开发布时间戳 | `2020-05-14 18:30:00` |
+| `cash_burn_months` | DOUBLE | 危机发生时的现金消耗月数 (Runway) | `1.2` |
+| `debt_ratio` | DOUBLE | 资产负债率 (%) | `285.6` |
+| `gross_margin` | DOUBLE | 销售毛利率 (%) | `-32.4` |
+| `competitor_count` | DOUBLE | 赛道竞争对手密度 | `15.0` |
+| `official_announcement_id`| VARCHAR | 交易所决定书文号或法院破产裁定案号 | `深交所退市决议-[2020]078` |
+| `source_url` | VARCHAR | 巨潮资讯或交易所官方公告直达链接 | `http://www.cninfo.com.cn/...` |
+| `quality_status` | VARCHAR | 数据质量状态 (`MANUAL_REFERENCE` 待逐项核验) | `MANUAL_REFERENCE` |
+
+---
+
+### 7. `tech_training_samples` (前沿技术多期真实特征与多期前瞻标签训练表)
+| 字段名 | 类型 | 说明 | 示例 |
+| :--- | :--- | :--- | :--- |
+| `sample_id` | VARCHAR | 样本唯一标识 | `TECH_SAMPLE_TRANSFORMER_2017` |
+| `topic_id` | VARCHAR | 前沿技术主题编码 | `TOPIC_TRANSFORMER_LLM` |
+| `base_date` | DATE | 特征所属基准时点 (Point-in-Time 历史截面) | `2017-12-31` |
+| `published_at` | TIMESTAMP | 数据首次公开发布时间戳 | `2017-12-31 23:59:59` |
+| `velocity_1y` | DOUBLE | 过去1年文献与专利复合增速 | `120.0` |
+| `acceleration` | DOUBLE | 文献增长加速度 (二阶导数) | `45.0` |
+| `active_institutions`| DOUBLE | 参与独立科研与工业机构数量 | `85.0` |
+| `github_momentum` | DOUBLE | 开源社区关注与衍生热度 | `1200.0` |
+| `macro_multiplier` | DOUBLE | 当期宏观经济环境成长阻尼乘数 | `1.15` |
+| `entropy_score` | DOUBLE | 跨机构香农机构扩散熵 (0.0 ~ 1.0) | `0.52` |
+| `novelty_score` | DOUBLE | 技术语义新颖度得分 (0.0 ~ 1.0) | `0.95` |
+| `target_1y` | DOUBLE | 真实历史1年后实际学术与开源成果增长倍数 | `1.85` |
+| `target_3y` | DOUBLE | 真实历史3年后实际学术与开源成果增长倍数 | `4.20` |
+| `target_5y` | DOUBLE | 真实历史5年后实际学术与开源成果增长倍数 | `8.60` |
+| `quality_status` | VARCHAR | 数据质量状态 | `MANUAL_REFERENCE` |
