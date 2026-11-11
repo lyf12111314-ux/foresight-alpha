@@ -11,7 +11,7 @@ class EnterpriseCollector(BaseCollector):
     """企业经营指标采集器"""
 
     def __init__(self):
-        super().__init__(source_name="CNINFO_Exchange_Disclosures", base_url="http://www.cninfo.com.cn")
+        super().__init__(source_name="CNINFO_Manual_Reference", base_url="http://www.cninfo.com.cn")
 
     def get_core_enterprise_financials(self) -> List[Dict[str, Any]]:
         """获取覆盖典型硬科技与新兴产业核心标的的真实历史财务时序 (2018-2024)
@@ -111,7 +111,7 @@ class EnterpriseCollector(BaseCollector):
                 as_of_date=as_of_d,
                 published_at=pub_dt,
                 source_url=f"http://www.cninfo.com.cn/new/disclosure/stock?orgId={cid}",
-                quality_status=DataQualityStatus.VALIDATED,
+                quality_status=DataQualityStatus.MANUAL_REFERENCE,
                 raw_hash=self.calculate_hash(raw_payload)
             )
 

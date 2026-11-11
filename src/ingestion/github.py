@@ -64,7 +64,7 @@ class GithubCollector(BaseCollector):
                     as_of_date=updated_at.date(),
                     published_at=updated_at,
                     source_url=item.get("html_url"),
-                    quality_status=DataQualityStatus.VALIDATED,
+                    quality_status=DataQualityStatus.UNVERIFIED,
                     raw_hash=self.calculate_hash(raw_json)
                 )
 

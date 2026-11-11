@@ -36,9 +36,10 @@ class PointInTimeBacktestEngine:
         # 1. 在 cutoff_date 生成当时的预测候选池 (物理隔离未来数据)
         candidates = self.pool_manager.build_opportunity_pool(cutoff_date=cutoff_date)
 
-        # 预测得分元组列表 [(topic_id, composite_score)]
-        predicted_scores = [(c["topic_id"], c["composite_score"]) for c in candidates]
-        predicted_probs = [min(1.0, c["composite_score"] / 100.0) for c in candidates]
+        # 预测得分元组列表 [(topic_id, research_score)]
+        predicted_scores = [(c["topic_id"], c.get("research_score", c.get("composite_score", 0.0))) for c in candidates]
+        # 严格区分预测概率：仅当模型存在真正经过校准的概率时记录，严禁将研究评分 / 100 伪装成成功概率
+        predicted_probs = [c.get("calibrated_probability") for c in candidates]
 
         # 2. 从后续真实历史数据中提取事实标签 (Ground Truth)
         # 成功定义：在 evaluation_date 时，该技术文献量或企业收入较 cutoff_date 增长超过 2.0 倍
@@ -61,7 +62,8 @@ class PointInTimeBacktestEngine:
                 # 若实际增长倍数超过 1.9 倍，则判定为成功爆发的技术机会 (Label=1)
                 is_hit = 1 if growth_actual >= 1.9 else 0
             else:
-                is_hit = 1 if c["composite_score"] > 75.0 else 0
+                # 严守审计底线：缺乏真实历史验证数据时，判定为未命中(0)，严禁使用模型自身评分(>75)进行循环自证
+                is_hit = 0
             true_labels[tid] = is_hit
 
         # 3. 计算评估指标

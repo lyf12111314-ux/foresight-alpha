@@ -2,6 +2,8 @@
 from src.core.types import (
     ObjectLevel,
     DataQualityStatus,
+    PredictionStatus,
+    ModelTrainingStatus,
     MacroRegime,
     ProvenanceMetadata,
     TechTopicEntity,
@@ -19,6 +21,8 @@ from src.core.database import DatabaseManager, db_manager
 __all__ = [
     "ObjectLevel",
     "DataQualityStatus",
+    "PredictionStatus",
+    "ModelTrainingStatus",
     "MacroRegime",
     "ProvenanceMetadata",
     "TechTopicEntity",

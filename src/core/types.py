@@ -19,11 +19,33 @@ class ObjectLevel(int, Enum):
 
 
 class DataQualityStatus(str, Enum):
-    """数据质量状态"""
-    VALIDATED = "VALIDATED"                 # 权威已校验
-    PROVISIONAL = "PROVISIONAL"             # 临时/预估
-    INSUFFICIENT_HISTORY = "INSUFFICIENT"   # 历史样本不足
-    UNVERIFIED = "UNVERIFIED"               # 待进一步交叉验证
+    """数据质量状态 (符合 V1.1 真实性审计标准)"""
+    VERIFIED = "VERIFIED"                   # 真实且已经核实的数据
+    UNVERIFIED = "UNVERIFIED"               # 真实来源声明但尚未核实的数据
+    SYNTHETIC = "SYNTHETIC"                 # 程序生成的模拟数据
+    MANUAL_REFERENCE = "MANUAL_REFERENCE"   # 人工录入、待逐项核实的数据
+    UNAVAILABLE = "UNAVAILABLE"             # 无法获取的数据
+
+    # 兼容历史别名
+    VALIDATED = "VERIFIED"                  # 兼容原有代码中的 VALIDATED 引用
+    PROVISIONAL = "UNVERIFIED"              # 兼容原有代码中的 PROVISIONAL 引用
+    INSUFFICIENT_HISTORY = "UNAVAILABLE"    # 兼容原有代码中的 INSUFFICIENT 引用
+
+
+class PredictionStatus(str, Enum):
+    """预测准入状态"""
+    PREDICTED = "PREDICTED"                         # 经过验证模型生成的正式预测
+    NOT_PREDICTABLE = "NOT_PREDICTABLE"             # 数据不足，标记为不可预测
+    MODEL_NOT_TRAINED = "MODEL_NOT_TRAINED"         # 模型尚未训练，禁止输出正式预测
+    UNVERIFIED_RESEARCH = "UNVERIFIED_RESEARCH"     # 仅供研究参考的未验证估计
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"         # 历史数据不足以支撑推演
+
+
+class ModelTrainingStatus(str, Enum):
+    """模型训练状态"""
+    TRAINED = "TRAINED"                             # 已使用真实验证数据完成训练
+    MODEL_NOT_TRAINED = "MODEL_NOT_TRAINED"         # 模型未训练
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"         # 真实样本不足无法训练
 
 
 class MacroRegime(str, Enum):
@@ -114,18 +136,21 @@ class InvestableAssetEntity(BaseModel):
 class ForecastRecord(BaseModel):
     """模型预测记录 (严格记录不可篡改)"""
     forecast_id: str
-    target_id: str                           # 预测目标对象ID
+    target_id: str                               # 预测目标对象ID
     target_level: ObjectLevel
     model_name: str
     model_version: str
-    as_of_data_date: date                    # 数据截止日期 (Point-in-Time)
+    as_of_data_date: date                        # 数据截止日期 (Point-in-Time)
     prediction_created_at: datetime = Field(default_factory=datetime.utcnow)
-    horizon_years: int                       # 预测期限 (1, 3, 5 年)
-    predicted_metric: str                    # 如 adoption_rate, revenue_growth, cagr_multiple
-    point_estimate: float                    # 点估计值
-    confidence_interval_low: float           # 置信区间下界
-    confidence_interval_high: float          # 置信区间上界
-    confidence_score: float                  # 置信度 (0.0 ~ 1.0)
+    horizon_years: int                           # 预测期限 (1, 3, 5 年)
+    predicted_metric: str                        # 如 adoption_rate, revenue_growth, cagr_multiple
+    point_estimate: Optional[float] = None       # 点估计值 (未训练或不可预测时为 None)
+    confidence_interval_low: Optional[float] = None
+    confidence_interval_high: Optional[float] = None
+    confidence_score: Optional[float] = None     # 经过校准的置信度/概率 (未校准时为 None)
+    is_calibrated: bool = False                  # 是否通过独立经验校准
+    is_verified_forecast: bool = False           # 是否为经过真实验证的正式预测
+    prediction_status: PredictionStatus = PredictionStatus.UNVERIFIED_RESEARCH
     scenarios: Dict[str, float] = Field(default_factory=dict)  # {"bear": x, "base": y, "bull": z}
     driver_features: Dict[str, float] = Field(default_factory=dict)
 

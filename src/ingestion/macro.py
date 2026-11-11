@@ -51,7 +51,7 @@ class MacroCollector(BaseCollector):
                             as_of_date=as_of_date,
                             published_at=published_at,
                             source_url=f"{url}?date={yr}",
-                            quality_status=DataQualityStatus.VALIDATED,
+                            quality_status=DataQualityStatus.UNVERIFIED,
                             raw_hash=self.calculate_hash(raw_json)
                         )
 
@@ -141,8 +141,8 @@ class MacroCollector(BaseCollector):
                     record_id=f"{code}_{as_of_str}",
                     as_of_date=as_of_d,
                     published_at=pub_dt,
-                    source_url="http://www.stats.gov.cn/sj/ndsj/",
-                    quality_status=DataQualityStatus.VALIDATED,
+                    source_url="http://www.stats.gov.cn/sj/ndsj/ (待逐期官方公报审计核对)",
+                    quality_status=DataQualityStatus.MANUAL_REFERENCE,
                     raw_hash=self.calculate_hash(raw_payload)
                 )
                 records.append({

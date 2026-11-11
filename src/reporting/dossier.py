@@ -16,11 +16,14 @@ class ResearchDossierGenerator:
         topic_id = candidate_info.get("topic_id", "TOPIC_UNKNOWN")
         topic_name = candidate_info.get("topic_name", "前沿新兴产业")
         domain_id = candidate_info.get("domain_id", "TECH_SECTOR")
-        score = candidate_info.get("composite_score", 75.0)
-        confidence = candidate_info.get("calibrated_confidence", 0.80)
+        score = candidate_info.get("research_score", candidate_info.get("composite_score", 75.0))
+        data_cov = candidate_info.get("data_coverage_score", 60.0)
+        calibrated_prob = candidate_info.get("calibrated_probability")
+        pred_status = candidate_info.get("prediction_status", "UNVERIFIED_RESEARCH")
+        is_verified = candidate_info.get("is_verified_forecast", False)
         rating = candidate_info.get("rating", "WATCHLIST_A")
-        growth_3y = candidate_info.get("growth_3y_multiple", 2.2)
-        prob_10x = candidate_info.get("prob_10x_super_return_pct", 8.5)
+        growth_3y = candidate_info.get("growth_3y_multiple")
+        prob_10x = candidate_info.get("prob_10x_super_return_pct")
         asymmetry_ratio = candidate_info.get("asymmetry_ratio", 2.5)
         highest_tier = candidate_info.get("highest_margin_tier", "UPSTREAM")
         penetration = candidate_info.get("penetration_pct", 8.5)
@@ -29,13 +32,16 @@ class ResearchDossierGenerator:
         legal_assets = candidate_info.get("legal_assets", [])
 
         now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        prob_str = f"{int(calibrated_prob * 100)}%" if calibrated_prob is not None else "未校准 (无独立贝叶斯验证)"
+        growth_str = f"{growth_3y} 倍" if growth_3y is not None else "真实样本不足，暂不输出预测倍数"
 
         report_md = f"""# 【Foresight Alpha 深度研报】{topic_name}（{topic_id}）
 
 > **报告发布日期**：{now_str}  
 > **数据审计截止**：{candidate_info.get('as_of_data_date', date.today().isoformat())}  
-> **模型版本**：ForesightAlpha-Synthesizer v1.0.0  
-> **综合评分**：`{score} / 100` ｜ **校准置信度**：`{int(confidence * 100)}%` ｜ **评级**：`{rating}`  
+> **模型版本**：ForesightAlpha-Synthesizer v1.1.0  
+> **研究综合评分**：`{score} / 100` ｜ **数据覆盖度**：`{data_cov}%` ｜ **预测校准状态**：`{pred_status}`  
+> **经校准成功概率**：`{prob_str}` ｜ **评级**：`{rating}`  
 > **免责声明**：本报告为宏观与产业量化模型辅助决策成果，不构成确定性投资收益承诺。
 
 ---
@@ -84,15 +90,28 @@ class ResearchDossierGenerator:
 ## 9. 预测模型结果与置信区间
 基于 LightGBM 预测器与 Bass/Logistic 扩散模型交叉印证：
 - **当前扩散渗透率**：`{penetration}%`（处于 {stage_desc}）；
-- **未来 1 年采纳规模增速**：约 25% - 35%；
-- **未来 3 年产业复合增长预期**：`{growth_3y} 倍`（80% 置信区间：`[{round(growth_3y*0.82, 1)}x, {round(growth_3y*1.28, 1)}x]`）；
+"""
+        if growth_3y is not None:
+            report_md += f"""- **未来 3 年产业复合增长预期**：`{growth_3y} 倍`（80% 置信区间：`[{round(growth_3y*0.82, 1)}x, {round(growth_3y*1.28, 1)}x]`）；
 - **未来 5 年产业空间推演**：预计跨越 20% 主流采纳临界点。
+"""
+        else:
+            report_md += """- **增长预测状态**：`MODEL_NOT_TRAINED`（由于真实历史样本不足，系统严格禁止使用合成样本或固定经验倍数输出预测结果）；
+- **数据准入要求**：需补齐至少 20 期经过审计的产业真实渗透与财务指标后方可激活点估计与置信区间。
+"""
 
+        report_md += """
 ## 10. 不同情景下的发展路径推演
-- **保守情景 (Bear Case, 概率 20%)**：下游验证进度迟缓，三年增长倍数收敛至 `{round(growth_3y * 0.70, 2)}x`；
+"""
+        if growth_3y is not None:
+            report_md += f"""- **保守情景 (Bear Case, 概率 20%)**：下游验证进度迟缓，三年增长倍数收敛至 `{round(growth_3y * 0.70, 2)}x`；
 - **基准情景 (Base Case, 概率 60%)**：按照当前技术扩散速度平稳推进，三年增长倍数达到 `{growth_3y}x`；
 - **乐观情景 (Bull Case, 概率 20%)**：出现爆款商业应用，三年非线性增长达 `{round(growth_3y * 1.35, 2)}x`。
+"""
+        else:
+            report_md += "- **情景推演状态**：当前为定性观察阶段，待真实训练样本达标后自动化生成量化情景推演。\n"
 
+        report_md += """
 ## 11. 合法参与方式及退出条件
 本系统严格排查法律准入，已映射合规二级市场资产标的：
 """

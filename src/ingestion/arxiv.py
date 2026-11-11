@@ -70,7 +70,7 @@ class ArxivCollector(BaseCollector):
                     as_of_date=pub_dt.date(),
                     published_at=pub_dt,
                     source_url=paper_id,
-                    quality_status=DataQualityStatus.VALIDATED,
+                    quality_status=DataQualityStatus.UNVERIFIED,
                     raw_hash=self.calculate_hash(raw_json)
                 )
 

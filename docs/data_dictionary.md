@@ -13,10 +13,17 @@
 | `as_of_date` | DATE | 统计所属时间 (数据反映的真实业务时点) | `2023-12-31` |
 | `published_at`| TIMESTAMP | 首次公开发布时间 (Point-in-Time 物理切片基准) | `2023-12-31 23:59:59` |
 | `ingested_at` | TIMESTAMP | 系统抓取入库时间 | `2026-11-11 08:00:00` |
-| `quality_status`| VARCHAR | 数据质量状态 (`VALIDATED` / `PROVISIONAL`) | `VALIDATED` |
-| `data_version`| VARCHAR | 数据规范版本 | `v1.0` |
+| `quality_status`| VARCHAR | 数据质量状态 (`VERIFIED` / `UNVERIFIED` / `SYNTHETIC` / `MANUAL_REFERENCE` / `UNAVAILABLE`) | `MANUAL_REFERENCE` |
+| `data_version`| VARCHAR | 数据规范版本 | `v1.1` |
 | `raw_hash` | VARCHAR | 原始载荷 SHA-256 哈希防篡改指纹 | `e3b0c44298fc1c149afbf4c8...` |
 | `payload` | JSON | 原始文本/结构化字典完整载荷 | `{"count": 1500, "citations": ...}` |
+
+> **V1.1 数据质量状态规范说明**：
+> - `VERIFIED`：真实且已经审计核实的数据（具备可追溯官方信源、合规公开时间戳且通过交叉验真）。
+> - `UNVERIFIED`：真实来源声明但尚未完成人工/第三方逐项审计核实的数据（如开放API实时抓取未核验数据）。
+> - `SYNTHETIC`：程序生成的模拟/合成数据（仅限测试模块使用，严禁进入生产预测）。
+> - `MANUAL_REFERENCE`：系统内置或人工整理录入、待逐项核实原始公告出处的参考数据。
+> - `UNAVAILABLE`：无法合法合规获取或缺失历史真实记录的数据。
 
 ---
 
@@ -75,13 +82,15 @@
 | `target_id` | VARCHAR | 预测目标对象ID (如 `TOPIC_EMBODIED_AI`) |
 | `target_level`| INTEGER | 对象层级 (1-5) |
 | `model_name` | VARCHAR | 生成模型标识 (`ForesightAlpha-Synthesizer`) |
-| `model_version`| VARCHAR| 模型算法版本 (`1.0.0`) |
+| `model_version`| VARCHAR| 模型算法版本 (`1.1.0-audit`) |
 | `as_of_data_date`| DATE | 预测使用的数据截止日期 |
 | `horizon_years`| INTEGER | 预测期限 (1, 3, 5 年) |
 | `predicted_metric`| VARCHAR| 预测目标指标名称 |
-| `point_estimate`| DOUBLE | 点估计值 |
-| `ci_low` | DOUBLE | 置信区间下界 |
-| `ci_high` | DOUBLE | 置信区间上界 |
-| `confidence_score`| DOUBLE | 贝叶斯校准置信度 (0.0 ~ 1.0) |
+| `point_estimate`| DOUBLE | 点估计值 (若模型未训练或数据不足，允许为 NULL，严禁使用虚假倍数填充) |
+| `ci_low` | DOUBLE | 置信区间下界 (未训练为 NULL) |
+| `ci_high` | DOUBLE | 置信区间上界 (未训练为 NULL) |
+| `confidence_score`| DOUBLE | 贝叶斯校准置信度 (若无独立校准结果为 NULL，禁止硬编码伪置信度) |
+| `prediction_status`| VARCHAR | 预测准入状态 (`PREDICTED` / `NOT_PREDICTABLE` / `MODEL_NOT_TRAINED` / `UNVERIFIED_RESEARCH`) |
+| `is_verified_forecast`| BOOLEAN | 是否为经过核验的正式预测 (默认 FALSE) |
 | `scenarios_json`| JSON | 悲观/基准/乐观三情景分布 |
 | `drivers_json` | JSON | 特征重要性敏感度归因 |

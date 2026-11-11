@@ -67,3 +67,18 @@ $$\text{可使用数据集} = \{ D_i \mid \text{published\_at}(D_i) \le T \}$$
 3. **Brier Score**：概率校准优度：
    $$\text{Brier} = \frac{1}{N} \sum_{i=1}^N (p_i - y_i)^2$$
 4. **超额胜率**：与均匀随机基准（Random Benchmark）和简单历史动量外推（CAGR Extrapolation）的直接净胜率差值。
+
+---
+
+## 六、V1.1 数据真实性与模型可信度准入体系 (P0-01 规范)
+
+### 6.1 真实数据与合成测试数据物理隔离
+1. **严禁合成数据污染生产模型**：生产代码中 `LightGBMGrowthForecaster` 与 `CompanySurvivalEngine` 的训练逻辑仅接受经过外部审计的真实历史特征与真实事件队列。测试所需的模拟生成逻辑完全隔离至 `tests/helpers/`。
+2. **样本量与事件数准入门槛**：
+   - LightGBM 正式训练：至少需具备 20 期真实且已核验的特征与标签样本，不足时返回 `MODEL_NOT_TRAINED`，预测点估计严格置为 `None`。
+   - Cox 生存分析：至少需包含 20 家企业队列样本且观测到至少 5 例破产/退市/重整等真实违约事件，不足时返回 `INSUFFICIENT_DATA`，绝不输出虚假破产概率。
+
+### 6.2 双轨制架构：研究关注度评分 vs 经校准正式预测
+1. **客观研究评分 (Research Score, 0-100)**：综合宏观阻尼、学术文献动能、产业链利润池壁垒与历史时序覆盖度，度量前沿产业关注度与发展动能。
+2. **正式预测概率 (Calibrated Probability)**：严格仅在具备独立贝叶斯校准器时输出；严禁将研究评分除以 100 伪装成成功概率。
+3. **正式预测准入拦截**：在数据服务层、API (`/api/v1/forecasts/verified`) 和 Streamlit Web 界面建立硬性拦截门禁，模型未充分训练真实数据时，明确返回 `NO_VERIFIED_FORECASTS`，杜绝任何虚假成长倍数和胜率流入决策层。

@@ -81,7 +81,7 @@ if menu == "1. 综合研究首页":
     st.markdown("*通过长期经济周期、前沿技术演进、产业链利润沉淀与企业生存风险，提前捕捉未来 3—10 年非线性成长机会。*")
     
     # 顶部关键指标卡片
-    pool = pool_mgr.build_opportunity_pool()
+    pool = pool_mgr.get_research_candidates()
     macro_df = db_manager.query_df("SELECT * FROM macro_indicators ORDER BY as_of_date ASC")
     macro_status = macro_model.get_latest_regime(macro_df) if not macro_df.empty else {"regime": "EXPANSION", "macro_growth_multiplier": 1.15}
     active_alerts = alert_mgr.get_active_alerts()
@@ -99,9 +99,9 @@ if menu == "1. 综合研究首页":
     with c2:
         st.markdown(f"""
             <div class="metric-card">
-                <div class="metric-title">机会池顶级标的 (Top 1)</div>
+                <div class="metric-title">研究关注度第一标的</div>
                 <div class="metric-value">{top_candidate['topic_name'] if top_candidate else 'N/A'}</div>
-                <span class="badge-alpha">综合分: {top_candidate['composite_score'] if top_candidate else '0'}</span>
+                <span class="badge-alpha">研究评分: {top_candidate.get('research_score', top_candidate.get('composite_score', 0)) if top_candidate else '0'}</span>
             </div>
         """, unsafe_allow_html=True)
     with c3:
@@ -121,21 +121,33 @@ if menu == "1. 综合研究首页":
             </div>
         """, unsafe_allow_html=True)
 
-    st.markdown("### 🏆 核心高潜非对称机会推荐榜")
-    df_pool = pd.DataFrame([
-        {
-            "排名": idx + 1,
-            "技术主题": c["topic_name"],
-            "所属赛道": c["domain_id"],
-            "综合评分 (0-100)": c["composite_score"],
-            "模型置信度": f"{int(c['calibrated_confidence'] * 100)}%",
-            "未来3年复合增长倍数": f"{c['growth_3y_multiple']}x",
-            "10倍非对称大胜概率": f"{c['prob_10x_super_return_pct']}%",
-            "评级": c["rating"]
-        }
-        for idx, c in enumerate(pool)
-    ])
-    st.dataframe(df_pool, use_container_width=True, hide_index=True)
+    tab_verified, tab_research = st.tabs(["🎯 经校准正式预测榜 (Verified Forecasts)", "📋 产业研究关注度候选池 (Research Candidates)"])
+
+    with tab_verified:
+        verified_resp = pool_mgr.get_verified_forecast_ranking()
+        if verified_resp["status"] == "NO_VERIFIED_FORECASTS":
+            st.warning(f"🛡️ **预测准入拦截**：{verified_resp['message']}")
+            st.info("系统严格执行准入机制：模型未经真实历史样本充分训练且未完成独立贝叶斯概率校准前，绝不输出虚假成长倍数或胜率。")
+        else:
+            st.dataframe(pd.DataFrame(verified_resp["verified_rankings"]), use_container_width=True, hide_index=True)
+
+    with tab_research:
+        st.caption("注：研究关注度榜单反映技术文献增长热度与产业链结构特征，不等同于经过验证的投资回报预测。")
+        df_pool = pd.DataFrame([
+            {
+                "排名": idx + 1,
+                "技术主题": c["topic_name"],
+                "所属赛道": c["domain_id"],
+                "研究综合评分 (0-100)": c.get("research_score", c.get("composite_score", 0)),
+                "数据覆盖度": f"{c.get('data_coverage_score', 0)}%",
+                "预测状态": c.get("prediction_status", "UNVERIFIED_RESEARCH"),
+                "3年预测倍数": f"{c['growth_3y_multiple']}x" if c.get("growth_3y_multiple") is not None else "真实样本不足",
+                "校准胜率": f"{int(c['calibrated_probability'] * 100)}%" if c.get("calibrated_probability") is not None else "未校准",
+                "评级": c["rating"]
+            }
+            for idx, c in enumerate(pool)
+        ])
+        st.dataframe(df_pool, use_container_width=True, hide_index=True)
 
     col_l, col_r = st.columns([1, 1])
     with col_l:
@@ -165,16 +177,17 @@ elif menu == "2. 新兴技术雷达":
     st.title("📡 新兴技术自动发现与技术雷达")
     st.markdown("基于 OpenAlex、arXiv 与 GitHub API，以语义向量与动态聚类算法自动识别新生技术主题，计算新颖度与扩散加速度。")
 
-    pool = pool_mgr.build_opportunity_pool()
+    pool = pool_mgr.get_research_candidates()
     radar_data = []
     for c in pool:
         radar_data.append({
             "Topic": c["topic_name"],
-            "CompositeScore": c["composite_score"],
-            "GrowthMultiple3Y": c["growth_3y_multiple"],
-            "Confidence": c["calibrated_confidence"] * 100,
+            "ResearchScore": c.get("research_score", c.get("composite_score", 0)),
+            "GrowthMultiple3Y": c.get("growth_3y_multiple") or 1.0,
+            "GrowthStatus": f"{c.get('growth_3y_multiple')}x" if c.get("growth_3y_multiple") is not None else "定性跟踪期(未训练)",
+            "DataCoverage": c.get("data_coverage_score", 50),
             "Domain": c["domain_id"],
-            "Penetration": c["penetration_pct"]
+            "Penetration": c.get("penetration_pct", 0)
         })
     df_radar = pd.DataFrame(radar_data)
 
@@ -182,22 +195,22 @@ elif menu == "2. 新兴技术雷达":
         df_radar,
         x="Penetration",
         y="GrowthMultiple3Y",
-        size="CompositeScore",
+        size="ResearchScore",
         color="Domain",
         hover_name="Topic",
         text="Topic",
         labels={
             "Penetration": "当前技术渗透率 (%)",
-            "GrowthMultiple3Y": "未来3年预期增长倍数 (Point Estimate)",
-            "CompositeScore": "综合评分"
+            "GrowthMultiple3Y": "未来3年复合增长倍数 (Point Estimate, 未训练默认为1.0x基线)",
+            "ResearchScore": "研究评分"
         },
-        title="新兴技术非线性成长潜力象限图 (气泡大小表示综合评分)"
+        title="新兴技术非线性成长潜力象限图 (气泡大小表示研究评分)"
     )
     fig_scatter.update_traces(textposition="top center")
     st.plotly_chart(format_plotly_chart(fig_scatter), use_container_width=True)
 
     st.markdown("### 自动发现的新兴技术主题聚类表")
-    st.table(df_radar[["Topic", "Domain", "CompositeScore", "GrowthMultiple3Y", "Penetration"]])
+    st.table(df_radar[["Topic", "Domain", "ResearchScore", "GrowthStatus", "Penetration", "DataCoverage"]])
 
 # ==========================================
 # 3. 技术趋势详情
@@ -350,17 +363,22 @@ elif menu == "6. 企业成长与生存分析":
 # 7. 非对称机会候选池
 # ==========================================
 elif menu == "7. 非对称机会候选池":
-    st.title("🎯 非对称机会候选池与蒙特卡洛模拟")
+    st.title("🎯 非对称机会候选池与深度研判")
     st.markdown("严格区分产业规模增长 $\neq$ 企业收入增长 $\neq$ 估值扩张 $\neq$ 投资者最终净收益。")
 
-    pool = pool_mgr.build_opportunity_pool()
+    pool = pool_mgr.get_research_candidates()
     for c in pool:
-        with st.expander(f"【{c['rating']}】{c['topic_name']} — 综合评分 {c['composite_score']}", expanded=True if c == pool[0] else False):
+        score = c.get('research_score', c.get('composite_score', 0))
+        status_label = c.get('prediction_status', 'UNVERIFIED_RESEARCH')
+        with st.expander(f"【{c['rating']}】{c['topic_name']} — 研究关注度 {score} (状态: {status_label})", expanded=True if c == pool[0] else False):
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("3年预期复合倍数", f"{c['growth_3y_multiple']}x")
-            c2.metric("非对称赔率比", f"{c['asymmetry_ratio']}:1")
-            c3.metric("10倍超级收益概率", f"{c['prob_10x_super_return_pct']}%")
-            c4.metric("3年经营生存概率", f"{int(c['survival_prob_3y']*100)}%")
+            growth_val = f"{c['growth_3y_multiple']}x" if c.get('growth_3y_multiple') is not None else "真实样本不足 (未训练)"
+            c1.metric("3年预期复合倍数", growth_val)
+            c2.metric("数据覆盖度", f"{c.get('data_coverage_score', 0)}%")
+            prob_val = f"{int(c['calibrated_probability'] * 100)}%" if c.get('calibrated_probability') is not None else "未独立校准"
+            c3.metric("经校准成功概率", prob_val)
+            surv_val = f"{int(c['survival_prob_3y'] * 100)}%" if c.get('survival_prob_3y') is not None else "真实事件不足 (未拟合)"
+            c4.metric("3年企业生存概率", surv_val)
 
             st.markdown("#### 合法可参与二级市场资产标的")
             for asset in c.get("legal_assets", []):
@@ -421,7 +439,8 @@ elif menu == "9. 历史回测中心":
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Precision@3 (Top 3 命中率)", f"{int(m['precision_at_3'] * 100)}%")
         c2.metric("Precision@5 (Top 5 命中率)", f"{int(m['precision_at_5'] * 100)}%")
-        c3.metric("Brier 概率校准误差", f"{m['brier_score']} (越低越好)")
+        brier_display = f"{m['brier_score']}" if m.get('brier_score') is not None else "未校准/无独立概率"
+        c3.metric("Brier 概率校准误差", brier_display)
         c4.metric("相对随机基准超额命中", f"+{int(m['excess_vs_random_baseline'] * 100)}%")
 
         st.markdown(f"**回测切片时点**：`{latest_bt['cutoff_date']}` ｜ **事后核验时点**：`{latest_bt['evaluation_date']}`")
@@ -465,6 +484,10 @@ elif menu == "11. 数据源与模型管理":
         cnt = db_manager.query_df(f"SELECT COUNT(*) as c FROM {t}").iloc[0]["c"]
         table_stats.append({"表名": t, "记录行数": cnt, "存储格式": "DuckDB Columnar / Parquet"})
     st.table(pd.DataFrame(table_stats))
+
+    st.markdown("### 数据质量与验证状态分布 (DataQualityStatus Audit)")
+    df_quality = db_manager.query_df("SELECT quality_status, COUNT(*) as record_count FROM raw_records GROUP BY quality_status")
+    st.table(df_quality)
 
     st.markdown("### 最新入库原始数据溯源抽样 (Point-in-Time 证据链)")
     df_raw = db_manager.query_df("SELECT record_id, source_name, as_of_date, published_at, ingested_at, quality_status, raw_hash FROM raw_records ORDER BY ingested_at DESC LIMIT 6")
