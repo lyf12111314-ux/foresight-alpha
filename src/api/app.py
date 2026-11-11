@@ -39,7 +39,21 @@ def get_macro_status() -> Dict[str, Any]:
 
 @app.get("/api/v1/opportunities")
 def get_opportunity_pool() -> List[Dict[str, Any]]:
-    return pool_manager.build_opportunity_pool()
+    """获取研究候选对象池 (按学术与产业研究关注度排序)
+    
+    注意：本接口返回的是研究线索与产业跟踪候选，包含未验证研究对象，严禁直接作为正式投资预测结果使用。
+    """
+    return pool_manager.get_research_candidates()
+
+
+@app.get("/api/v1/forecasts/verified")
+def get_verified_forecasts() -> Dict[str, Any]:
+    """获取经严格校准与真实数据训练的正式预测排名
+    
+    准入原则：仅收录数据质量为 VERIFIED 且模型经过正式真实历史样本训练的预测结果。
+    当前阶段若真实样本不足，明确返回 NO_VERIFIED_FORECASTS 状态，严禁输出虚构增长倍数。
+    """
+    return pool_manager.get_verified_forecast_ranking()
 
 
 @app.get("/api/v1/alerts")

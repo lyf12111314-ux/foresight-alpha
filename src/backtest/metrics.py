@@ -28,15 +28,17 @@ class BacktestMetricsCalculator:
         return round(float(hits / tot_positives), 3)
 
     @staticmethod
-    def brier_score(predicted_probs: List[float], actual_outcomes: List[int]) -> float:
+    def brier_score(predicted_probs: List[float | None], actual_outcomes: List[int]) -> float | None:
         """计算 Brier Score (预测概率校准优度，取值 0.0-1.0，越低越好，0表示完美校准)
         
+        仅对真正经过概率校准的预测值计算。若无校准概率，返回 None。
         B = (1/N) * sum((p_i - y_i)^2)
         """
-        if len(predicted_probs) == 0:
-            return 0.0
-        p = np.array(predicted_probs, dtype=float)
-        y = np.array(actual_outcomes, dtype=float)
+        valid_pairs = [(p, y) for p, y in zip(predicted_probs, actual_outcomes) if p is not None]
+        if not valid_pairs:
+            return None
+        p = np.array([vp[0] for vp in valid_pairs], dtype=float)
+        y = np.array([vp[1] for vp in valid_pairs], dtype=float)
         score = np.mean((p - y) ** 2)
         return round(float(score), 4)
 

@@ -50,10 +50,17 @@ class SCurveDiffusionModel:
         t = np.array(time_steps, dtype=float)
         y = np.array(adoptions, dtype=float)
 
-        t_norm = t - t[0]
+        t_norm = t - t[0] if len(t) > 0 else np.array([])
         n_points = len(t)
         if n_points < 4:
-            raise ValueError("At least 4 time points required for S-curve diffusion fit.")
+            return {
+                "status": "INSUFFICIENT_DATA",
+                "growth_multiples": None,
+                "current_penetration_pct": None,
+                "inflection_point_year": None,
+                "stage_description": "历史样本不足4期，无法可靠拟合S曲线扩散模型 (禁止虚构推演)",
+                "forecast_series": []
+            }
 
         current_max = y[-1]
         future_t = np.arange(0, t_norm[-1] + forecast_horizon_years + 1)

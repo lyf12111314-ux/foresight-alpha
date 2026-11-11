@@ -39,7 +39,9 @@ def test_macro_collector_official_series():
     assert "indicator_code" in first
     assert "value" in first
     assert "provenance" in first
-    assert first["provenance"]["quality_status"] == DataQualityStatus.VALIDATED
+    # 严格数据质量审计：未逐项核实前，内置宏观参考数据标记为 MANUAL_REFERENCE，绝不可标记为 VERIFIED
+    assert first["provenance"]["quality_status"] == DataQualityStatus.MANUAL_REFERENCE
+    assert first["provenance"]["quality_status"] != DataQualityStatus.VERIFIED
 
 
 def test_enterprise_financials_collection():

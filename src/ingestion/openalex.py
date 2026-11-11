@@ -69,7 +69,7 @@ class OpenAlexCollector(BaseCollector):
                 as_of_date=as_of_date,
                 published_at=published_at,
                 source_url=f"{url}?search={query}&filter=publication_year:{year}",
-                quality_status=DataQualityStatus.VALIDATED,
+                quality_status=DataQualityStatus.UNVERIFIED,
                 raw_hash=self.calculate_hash(raw_str)
             )
 

@@ -118,16 +118,23 @@ class DatabaseManager:
                     prediction_created_at TIMESTAMP NOT NULL,
                     horizon_years INTEGER NOT NULL,
                     predicted_metric VARCHAR NOT NULL,
-                    point_estimate DOUBLE NOT NULL,
+                    point_estimate DOUBLE,
                     ci_low DOUBLE,
                     ci_high DOUBLE,
                     confidence_score DOUBLE,
+                    prediction_status VARCHAR DEFAULT 'UNVERIFIED_RESEARCH',
+                    is_verified_forecast BOOLEAN DEFAULT FALSE,
                     scenarios_json JSON,
                     drivers_json JSON
                 );
             """)
 
-            # 6. 预警事件日志
+            # 兼容既有数据库表字段增补
+            try:
+                conn.execute("ALTER TABLE model_forecasts ADD COLUMN IF NOT EXISTS prediction_status VARCHAR DEFAULT 'UNVERIFIED_RESEARCH';")
+                conn.execute("ALTER TABLE model_forecasts ADD COLUMN IF NOT EXISTS is_verified_forecast BOOLEAN DEFAULT FALSE;")
+            except Exception:
+                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS model_alerts (
                     alert_id VARCHAR PRIMARY KEY,
@@ -190,16 +197,18 @@ class DatabaseManager:
         table_name: str,
         cutoff_date: date,
         target_col: Optional[str] = None,
-        target_val: Optional[Any] = None
+        target_val: Optional[Any] = None,
+        require_verified_timestamp: bool = False
     ) -> pd.DataFrame:
         """严格的 Point-in-Time 查询接口。
         
         确保在 cutoff_date 时点，只读取当时已公开披露的数据 (published_at <= cutoff_date)，
         彻底防止未来信息泄露 (Lookahead Bias)。
+        若 require_verified_timestamp=True，仅允许经过时间验证且发布时间可信的数据参与计算。
         """
         sql = f"""
             SELECT * FROM {table_name}
-            WHERE published_at <= ?
+            WHERE published_at IS NOT NULL AND published_at <= ?
         """
         params = [cutoff_date]
         if target_col and target_val:

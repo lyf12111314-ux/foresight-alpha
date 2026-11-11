@@ -8,18 +8,26 @@ from src.value_chain.financial_audit import CommercializationAuditEngine
 
 
 def test_survival_engine_cox():
+    # 1. 真实训练样本与违约事件不足时，返回 INSUFFICIENT_DATA，禁止输出虚假破产概率
     engine = CompanySurvivalEngine()
-    engine.fit()
+    res_fit = engine.fit()
+    assert res_fit["status"] == "INSUFFICIENT_DATA"
     metrics = {
         "cash_burn_months": 24.0,
         "debt_ratio": 45.0,
         "gross_margin": 35.0,
         "competitor_count": 8.0
     }
-    res = engine.predict_company_survival(metrics)
-    assert "partial_hazard_ratio" in res
-    assert "survival_probabilities" in res
-    assert res["survival_probabilities"]["surv_3y"] > 0
+    res_untrained = engine.predict_company_survival(metrics)
+    assert res_untrained["status"] == "INSUFFICIENT_DATA"
+    assert res_untrained["survival_probabilities"]["surv_3y"] is None
+
+    # 2. 隔离的合成数据算法测试接口：在测试环境下验证 Cox 拟合算法与预测管线
+    engine.fit_synthetic_for_testing(n_samples=50)
+    res_trained = engine.predict_company_survival(metrics)
+    assert "partial_hazard_ratio" in res_trained
+    assert "survival_probabilities" in res_trained
+    assert res_trained["survival_probabilities"]["surv_3y"] > 0
 
 
 def test_commercialization_red_flag_audit():
