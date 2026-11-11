@@ -1,0 +1,149 @@
+# 五级研究对象与核心产业清单字典定义
+levels:
+  - id: 1
+    name: "技术主题 (Tech Topic)"
+    description: "具有突破性潜力的底层科学与工程技术，跨越论文、代码与专利"
+  - id: 2
+    name: "新兴产业及细分赛道 (Emerging Industry / Sector)"
+    description: "具备商业化产品形态和早期市场空间的产业分支"
+  - id: 3
+    name: "产业链环节 (Value Chain Segment)"
+    description: "上游材料/核心部件、中游集成/设备、下游应用运营"
+  - id: 4
+    name: "具体企业或项目 (Company / Entity / Project)"
+    description: "公开发行主体或代表性实体，具备真实经营和财务数据"
+  - id: 5
+    name: "可合法持有资产/经营权益 (Investable Asset / Operating Right)"
+    description: "可在公开二级市场、特定合规平台持有的合法收益凭证"
+
+core_domains:
+  - domain_id: "AI_INFRA"
+    name: "人工智能与智能体基础设施"
+    topics: ["Agentic AI", "神经拟态计算", "Transformer架构优化", "端侧AI大模型", "智能体交易协议"]
+    industries: ["AI算力芯片", "高速光通信", "向量数据基础设施", "AI开发平台", "具身智能云脑"]
+    value_chain_nodes:
+      - node_id: "AI_CHIP_DESIGN"
+        name: "算力芯片设计 (GPU/NPU/ASIC)"
+        tier: "UPSTREAM"
+        gross_margin_range: [45.0, 75.0]
+        capex_intensity: "HIGH"
+      - node_id: "OPTICAL_TRANSCEIVER"
+        name: "800G/1.6T 高速光模块"
+        tier: "MIDSTREAM"
+        gross_margin_range: [30.0, 45.0]
+        capex_intensity: "MEDIUM"
+      - node_id: "AI_CLOUD_COMPUTE"
+        name: "智能算力云服务与调度"
+        tier: "DOWNSTREAM"
+        gross_margin_range: [20.0, 35.0]
+        capex_intensity: "VERY_HIGH"
+
+  - domain_id: "ROBOTICS_EMBODIED"
+    name: "机器人与具身智能"
+    topics: ["具身大模型", "柔性触觉传感", "行星滚柱丝杠", "高功率密度关节电机", "双足步态控制"]
+    industries: ["人形机器人整机", "工业协作机器人", "外骨骼装备", "特种巡检机器人"]
+    value_chain_nodes:
+      - node_id: "ROLLER_SCREW"
+        name: "行星滚柱丝杠与减速器"
+        tier: "UPSTREAM"
+        gross_margin_range: [40.0, 55.0]
+        capex_intensity: "HIGH"
+      - node_id: "SERVO_SYSTEM"
+        name: "伺服系统与无框力矩电机"
+        tier: "UPSTREAM"
+        gross_margin_range: [35.0, 48.0]
+        capex_intensity: "MEDIUM"
+      - node_id: "ROBOT_INTEGRATION"
+        name: "机器人本体制造与装配"
+        tier: "MIDSTREAM"
+        gross_margin_range: [25.0, 38.0]
+        capex_intensity: "MEDIUM"
+      - node_id: "FACTORY_DEPLOYMENT"
+        name: "制造业产线自动化系统集成"
+        tier: "DOWNSTREAM"
+        gross_margin_range: [18.0, 28.0]
+        capex_intensity: "LOW"
+
+  - domain_id: "ENERGY_STORAGE"
+    name: "新型储能与虚拟电厂"
+    topics: ["全固态电池", "钠离子电池", "长时液流储能", "虚拟电厂聚合算法", "构网型逆变器"]
+    industries: ["大储系统集成", "工商业分布式储能", "虚拟电厂运营平台", "超快充桩网络"]
+    value_chain_nodes:
+      - node_id: "SOLID_ELECTROLYTE"
+        name: "固态电解质与高镍正极"
+        tier: "UPSTREAM"
+        gross_margin_range: [35.0, 50.0]
+        capex_intensity: "HIGH"
+      - node_id: "BMS_PCS"
+        name: "储能变流器 (PCS) 与电池管理系统"
+        tier: "MIDSTREAM"
+        gross_margin_range: [28.0, 42.0]
+        capex_intensity: "MEDIUM"
+      - node_id: "VPP_OPERATOR"
+        name: "虚拟电厂负荷聚合运营"
+        tier: "DOWNSTREAM"
+        gross_margin_range: [25.0, 40.0]
+        capex_intensity: "LOW"
+
+  - domain_id: "LOW_ALTITUDE_AERO"
+    name: "低空经济与先进航天"
+    topics: ["eVTOL气动布局", "分布式电推进(DEP)", "低空空域智联空管", "轻量化碳纤维复合材料"]
+    industries: ["载人/货运eVTOL", "低空物流无人机", "低轨卫星互联网终端"]
+    value_chain_nodes:
+      - node_id: "AERO_COMPOSITES"
+        name: "航空级高模量碳纤维"
+        tier: "UPSTREAM"
+        gross_margin_range: [40.0, 60.0]
+        capex_intensity: "HIGH"
+      - node_id: "AVIONICS_FLIGHT_CTRL"
+        name: "低空飞控与空管通信载荷"
+        tier: "MIDSTREAM"
+        gross_margin_range: [38.0, 52.0]
+        capex_intensity: "MEDIUM"
+      - node_id: "LOW_ALT_AIRLINE"
+        name: "低空观光与城际客运运营"
+        tier: "DOWNSTREAM"
+        gross_margin_range: [20.0, 32.0]
+        capex_intensity: "HIGH"
+
+  - domain_id: "BIOTECH_SYNTHETIC"
+    name: "合成生物与创新医疗"
+    topics: ["酶定向进化", "基因编辑CRISPR-Cas", "高通量菌株筛选", "mRNA药物递送", "微流控芯片"]
+    industries: ["生物基材料", "合成生物学原料药", "靶向核酸药物", "精准医疗伴随诊断"]
+    value_chain_nodes:
+      - node_id: "STRAIN_DESIGN"
+        name: "底盘细胞设计与基因合成"
+        tier: "UPSTREAM"
+        gross_margin_range: [50.0, 70.0]
+        capex_intensity: "MEDIUM"
+      - node_id: "BIO_FERMENTATION"
+        name: "高通量工业发酵与分离纯化"
+        tier: "MIDSTREAM"
+        gross_margin_range: [30.0, 45.0]
+        capex_intensity: "HIGH"
+      - node_id: "SYNTHETIC_COMMERCE"
+        name: "生物基材料终端品牌应用"
+        tier: "DOWNSTREAM"
+        gross_margin_range: [35.0, 55.0]
+        capex_intensity: "MEDIUM"
+
+  - domain_id: "DATA_ELEMENTS"
+    name: "数据要素与数字基础设施"
+    topics: ["隐私计算", "区块链可信数据存证", "数据资产估值算法", "行业数据要素交易所"]
+    industries: ["工业数据中台", "医疗健康数据产品", "金融合规风控数据要素"]
+    value_chain_nodes:
+      - node_id: "DATA_COMPUTE_ENGINE"
+        name: "可信执行环境与隐私计算硬件"
+        tier: "UPSTREAM"
+        gross_margin_range: [40.0, 58.0]
+        capex_intensity: "MEDIUM"
+      - node_id: "DATA_PRODUCT_PACKAGING"
+        name: "数据合规治理与标准化加工"
+        tier: "MIDSTREAM"
+        gross_margin_range: [35.0, 50.0]
+        capex_intensity: "LOW"
+      - node_id: "DATA_SERVICE_API"
+        name: "行业数据产品订阅交付"
+        tier: "DOWNSTREAM"
+        gross_margin_range: [60.0, 80.0]
+        capex_intensity: "LOW"

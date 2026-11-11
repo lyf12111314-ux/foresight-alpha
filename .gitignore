@@ -1,0 +1,27 @@
+# Python 虚拟环境与缓存
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# 数据库二进制文件与临时日志 (可通过 scripts/run_pipeline.py 一键重建)
+data/*.duckdb
+data/*.duckdb.wal
+data/raw/
+data/processed/
+
+# 操作系统与编辑器文件
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.log
