@@ -58,14 +58,17 @@ class OpportunityPoolManager:
         if cutoff_date is None:
             cutoff_date = date.today()
 
-        # 1. 查询宏观数据 (必须具备有效公开时间戳)
+        # 1. 查询宏观数据 (严格遵守 Point-in-Time 物理隔离，严禁在无数据时回退查询全量未来表)
         macro_df = db_manager.query_point_in_time("macro_indicators", cutoff_date)
-        if macro_df.empty:
-            macro_df = db_manager.query_df("SELECT * FROM macro_indicators ORDER BY as_of_date ASC")
-
-        latest_macro = self.macro_model.get_latest_regime(macro_df) if not macro_df.empty else {
-            "regime": "EXPANSION", "macro_growth_multiplier": 1.0
-        }
+        if not macro_df.empty:
+            latest_macro = self.macro_model.get_latest_regime(macro_df)
+        else:
+            latest_macro = {
+                "regime": "UNKNOWN",
+                "macro_growth_multiplier": 1.0,
+                "is_point_in_time_available": False,
+                "notes": f"截至时点 {cutoff_date.isoformat()} 尚无可获得的公开宏观指标。"
+            }
 
         # 2. 核心跟踪赛道
         topics = [
@@ -82,14 +85,10 @@ class OpportunityPoolManager:
 
         try:
             for tid, tname, domain_id in topics:
-                # 获取该主题技术时序指标
+                # 获取该主题技术时序指标 (严禁在无数据时全表扫描泄漏未来信息)
                 topic_metrics = db_manager.query_point_in_time(
                     "tech_metrics", cutoff_date, target_col="topic_id", target_val=tid
                 )
-                if topic_metrics.empty:
-                    topic_metrics = db_manager.query_df(
-                        "SELECT * FROM tech_metrics WHERE topic_id = ? ORDER BY as_of_date ASC", [tid]
-                    )
 
                 # 拐点检测
                 inflection_res = self.inflection_detector.analyze_tech_acceleration(topic_metrics)
@@ -127,17 +126,18 @@ class OpportunityPoolManager:
                 }
                 forecaster_pred = self.lgbm_forecaster.predict_growth(lgbm_features)
 
-                # 仅当机器学习预测器完成真实验证训练时才提取多期点估计
+                # 提取多期点估计 (若属于 UNVERIFIED_RESEARCH 实验模式，仅作为研究估计保留，绝不标记为正式已验证)
                 growth_mult = None
                 growth_multiples = None
-                if forecaster_pred.get("status") in [PredictionStatus.PREDICTED.value, "PREDICTED"] and forecaster_pred.get("forecasts"):
+                if forecaster_pred.get("status") in [PredictionStatus.PREDICTED.value, "PREDICTED", "UNVERIFIED_RESEARCH"] and forecaster_pred.get("forecasts"):
                     f3y = forecaster_pred["forecasts"].get("3y", {})
                     growth_mult = f3y.get("point_estimate")
-                    growth_multiples = {
-                        "1_year_multiplier": forecaster_pred["forecasts"].get("1y", {}).get("point_estimate"),
-                        "3_year_multiplier": growth_mult,
-                        "5_year_multiplier": forecaster_pred["forecasts"].get("5y", {}).get("point_estimate")
-                    }
+                    if growth_mult is not None:
+                        growth_multiples = {
+                            "1_year_multiplier": forecaster_pred["forecasts"].get("1y", {}).get("point_estimate"),
+                            "3_year_multiplier": growth_mult,
+                            "5_year_multiplier": forecaster_pred["forecasts"].get("5y", {}).get("point_estimate")
+                        }
 
                 diffusion_res = {
                     "status": forecaster_pred.get("status", "MODEL_NOT_TRAINED"),

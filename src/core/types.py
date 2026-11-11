@@ -41,11 +41,74 @@ class PredictionStatus(str, Enum):
     INSUFFICIENT_DATA = "INSUFFICIENT_DATA"         # 历史数据不足以支撑推演
 
 
+class ModelStage(str, Enum):
+    """模型开发与验证阶段 (V1.1 准入门禁标准)"""
+    UNTRAINED = "UNTRAINED"                         # 未训练
+    EXPERIMENTAL = "EXPERIMENTAL"                   # 实验/研究模式 (基于待核验参考数据，禁止用于正式预测)
+    BENCHMARK = "BENCHMARK"                         # 算法基准对照模型
+    VERIFIED_PRODUCTION = "VERIFIED_PRODUCTION"     # 生产就绪模型 (完全通过真实验证与样本外检验)
+
+
+class LabelMaturityStatus(str, Enum):
+    """时序标签成熟度状态 (Point-in-Time 审计追踪)"""
+    MATURED = "MATURED"                             # 观察期已满，真实标签已成熟可核实
+    NOT_MATURED = "NOT_MATURED"                     # 尚未到达实际观察期终点，严禁提前设为真实标签
+    UNKNOWN = "UNKNOWN"                             # 标签状态未知
+    UNAVAILABLE = "UNAVAILABLE"                     # 标签数据缺失不可得
+
+
+class GroundTruthOutcome(str, Enum):
+    """历史回测事实标签评估状态 (严禁将未成熟或证据不足误判为失败)"""
+    SUCCESS = "SUCCESS"                             # 经过核实的目标达成 (如实际增长超阈值)
+    FAILURE = "FAILURE"                             # 经过核实的目标未达成
+    UNKNOWN = "UNKNOWN"                             # 历史状态未明
+    NOT_MATURED = "NOT_MATURED"                     # 尚未到达评估期终点，不计入命中/未命中
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE" # 缺乏客观证据支撑，不计入确定性胜负
+
+
+class DistressEventType(str, Enum):
+    """企业生存与违约事件类型"""
+    BANKRUPTCY = "BANKRUPTCY"                                       # 法院受理破产清算
+    DELISTING = "DELISTING"                                         # 财务/重大违法被动退市
+    RESTRUCTURING = "RESTRUCTURING"                                 # 司法重整/破产重组
+    RIGHT_OFFERING_CANCELLATION = "RIGHT_OFFERING_CANCELLATION"     # 资不抵债配股/增发终止
+    CENSORED_ACTIVE = "CENSORED_ACTIVE"                             # 正常存续/右删失 (未发生终结性违约事件)
+
+
+class ModelVerificationInfo(BaseModel):
+    """模型多维验证状态 (明确分离四种不同状态，禁止用单一 TRAINED 混淆)"""
+    stage: ModelStage = ModelStage.UNTRAINED
+    is_algorithm_fitted: bool = False               # 算法是否已拟合收敛
+    is_data_verified: bool = False                  # 训练数据是否已通过逐项核验
+    is_out_of_sample_validated: bool = False        # 是否已通过样本外(OOS)跨周期验证
+    is_calibrated: bool = False                     # 预测概率是否已完成独立校准 (如 Brier/Isotonic)
+    dataset_version: Optional[str] = None
+    model_version: str = "v1.1-p0"
+    rejection_reason: Optional[str] = None
+
+
+class DualTimeSampleMetadata(BaseModel):
+    """双时间结构技术训练样本元数据"""
+    sample_id: str
+    topic_id: str
+    base_date: date                                 # 预测特征所属时间基准日 (T)
+    feature_published_at: datetime                  # 特征数据首次公开发布时间戳 (<= T)
+    feature_ingested_at: datetime = Field(default_factory=datetime.utcnow) # 采集入库时间
+    label_horizon_years: int                        # 预测期限 (1, 3, 5 年)
+    label_period_end: date                          # 结果观察期截止日 (T + horizon)
+    label_observed_at: Optional[datetime] = None    # 实际核验观察时间戳
+    label_status: LabelMaturityStatus = LabelMaturityStatus.NOT_MATURED
+    target_growth: Optional[float] = None           # 若未成熟，严格为 None
+    quality_status: DataQualityStatus = DataQualityStatus.MANUAL_REFERENCE
+    verification_notes: Optional[str] = None
+
+
 class ModelTrainingStatus(str, Enum):
-    """模型训练状态"""
-    TRAINED = "TRAINED"                             # 已使用真实验证数据完成训练
+    """模型训练状态 (兼容原有接口)"""
+    TRAINED = "TRAINED"                             # 已完成训练
     MODEL_NOT_TRAINED = "MODEL_NOT_TRAINED"         # 模型未训练
     INSUFFICIENT_DATA = "INSUFFICIENT_DATA"         # 真实样本不足无法训练
+    EXPERIMENTAL = "EXPERIMENTAL"                   # 实验模式拟合 (非正式生产)
 
 
 class MacroRegime(str, Enum):
@@ -150,6 +213,8 @@ class ForecastRecord(BaseModel):
     confidence_score: Optional[float] = None     # 经过校准的置信度/概率 (未校准时为 None)
     is_calibrated: bool = False                  # 是否通过独立经验校准
     is_verified_forecast: bool = False           # 是否为经过真实验证的正式预测
+    model_stage: ModelStage = ModelStage.UNTRAINED # 模型验证阶段
+    dataset_version: Optional[str] = None        # 使用的数据集版本
     prediction_status: PredictionStatus = PredictionStatus.UNVERIFIED_RESEARCH
     scenarios: Dict[str, float] = Field(default_factory=dict)  # {"bear": x, "base": y, "bull": z}
     driver_features: Dict[str, float] = Field(default_factory=dict)
