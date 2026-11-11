@@ -10,6 +10,7 @@ from src.ingestion.arxiv import ArxivCollector
 from src.ingestion.github import GithubCollector
 from src.ingestion.macro import MacroCollector
 from src.ingestion.enterprise import EnterpriseCollector
+from src.ingestion.tech_dataset import HistoricalTechDatasetCollector
 
 
 class IngestionPipeline:
@@ -21,12 +22,83 @@ class IngestionPipeline:
         self.github = GithubCollector()
         self.macro = MacroCollector()
         self.enterprise = EnterpriseCollector()
+        self.tech_dataset = HistoricalTechDatasetCollector()
+
+    def ingest_distress_cohort(self) -> int:
+        """入库企业违约与存续历史真实队列 (P1-01 训练底座)"""
+        records = self.enterprise.get_historical_distress_cohort()
+        conn = db_manager.get_connection()
+        count = 0
+        try:
+            for row in records:
+                prov = row["provenance"]
+                conn.execute("""
+                    INSERT OR REPLACE INTO raw_records 
+                    (record_id, source_name, source_url, as_of_date, published_at, ingested_at, quality_status, data_version, raw_hash, payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, [
+                    prov["record_id"], prov["source_name"], prov["source_url"],
+                    prov["as_of_date"], prov["published_at"], prov["ingested_at"],
+                    prov["quality_status"], prov["data_version"], prov["raw_hash"],
+                    row["raw_payload"]
+                ])
+                conn.execute("""
+                    INSERT OR REPLACE INTO company_distress_cohort
+                    (company_id, company_name, industry_sector, duration_months, is_distressed, distress_type, event_date, published_at, cash_burn_months, debt_ratio, gross_margin, competitor_count, official_announcement_id, source_url, quality_status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, [
+                    row["company_id"], row["company_name"], row["industry_sector"],
+                    row["duration_months"], row["is_distressed"], row["distress_type"],
+                    row["event_date"], row["published_at"], row["cash_burn_months"],
+                    row["debt_ratio"], row["gross_margin"], row["competitor_count"],
+                    row["official_announcement_id"], row["source_url"], row["quality_status"]
+                ])
+                count += 1
+        finally:
+            conn.close()
+        return count
+
+    def ingest_tech_training_samples(self) -> int:
+        """入库前沿技术多期真实特征与多期标签训练集 (P1-01 训练底座)"""
+        samples = self.tech_dataset.get_historical_tech_training_samples()
+        conn = db_manager.get_connection()
+        count = 0
+        try:
+            for s in samples:
+                prov = s["provenance"]
+                conn.execute("""
+                    INSERT OR REPLACE INTO raw_records 
+                    (record_id, source_name, source_url, as_of_date, published_at, ingested_at, quality_status, data_version, raw_hash, payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, [
+                    prov["record_id"], prov["source_name"], prov["source_url"],
+                    prov["as_of_date"], prov["published_at"], prov["ingested_at"],
+                    prov["quality_status"], prov["data_version"], prov["raw_hash"],
+                    s["raw_payload"]
+                ])
+                conn.execute("""
+                    INSERT OR REPLACE INTO tech_training_samples
+                    (sample_id, topic_id, base_date, published_at, velocity_1y, acceleration, active_institutions, github_momentum, macro_multiplier, entropy_score, novelty_score, target_1y, target_3y, target_5y, quality_status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, [
+                    s["sample_id"], s["topic_id"], s["base_date"], s["published_at"],
+                    s["velocity_1y"], s["acceleration"], s["active_institutions"],
+                    s["github_momentum"], s["macro_multiplier"], s["entropy_score"],
+                    s["novelty_score"], s["target_1y"], s["target_3y"], s["target_5y"],
+                    s["quality_status"]
+                ])
+                count += 1
+        finally:
+            conn.close()
+        return count
 
     def run_all(self, verbose: bool = True) -> Dict[str, int]:
         """执行全量数据采集与入库流水线"""
         stats = {
             "macro_indicators": 0,
             "enterprise_financials": 0,
+            "distress_cohort": 0,
+            "tech_training_samples": 0,
             "tech_metrics": 0,
             "raw_records": 0
         }
@@ -100,6 +172,40 @@ class IngestionPipeline:
 
             if verbose:
                 print(f" -> Ingested {len(fin_records)} enterprise financial records.")
+
+            # 2.1 入库企业违约与存续真实事件队列 (用于 Cox 模型)
+            if verbose:
+                print("[2.1/5] Ingesting Historical Distress & Survival Cohort...")
+            distress_cohort = self.enterprise.get_historical_distress_cohort()
+            for row in distress_cohort:
+                prov = row["provenance"]
+                conn.execute("""
+                    INSERT OR REPLACE INTO raw_records 
+                    (record_id, source_name, source_url, as_of_date, published_at, ingested_at, quality_status, data_version, raw_hash, payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, [
+                    prov["record_id"], prov["source_name"], prov["source_url"],
+                    prov["as_of_date"], prov["published_at"], prov["ingested_at"],
+                    prov["quality_status"], prov["data_version"], prov["raw_hash"],
+                    row["raw_payload"]
+                ])
+                stats["raw_records"] += 1
+
+                conn.execute("""
+                    INSERT OR REPLACE INTO company_distress_cohort
+                    (company_id, company_name, industry_sector, duration_months, is_distressed, distress_type, event_date, published_at, cash_burn_months, debt_ratio, gross_margin, competitor_count, official_announcement_id, source_url, quality_status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, [
+                    row["company_id"], row["company_name"], row["industry_sector"],
+                    row["duration_months"], row["is_distressed"], row["distress_type"],
+                    row["event_date"], row["published_at"], row["cash_burn_months"],
+                    row["debt_ratio"], row["gross_margin"], row["competitor_count"],
+                    row["official_announcement_id"], row["source_url"], row["quality_status"]
+                ])
+                stats["distress_cohort"] += 1
+
+            if verbose:
+                print(f" -> Ingested {len(distress_cohort)} historical enterprise distress cohort records.")
 
             if verbose:
                 print("[3/5] Ingesting Scholarly Research Trends (OpenAlex)...")
@@ -176,7 +282,38 @@ class IngestionPipeline:
                 """, [tot_stars, tot_forks, topic_id, topic_id])
 
             if verbose:
-                print(f"[5/5] Ingestion Complete! Stats: {stats}")
+                print("[5/5] Ingesting Multi-Horizon Historical Tech Training Samples...")
+            tech_samples = self.tech_dataset.get_historical_tech_training_samples()
+            for s in tech_samples:
+                prov = s["provenance"]
+                conn.execute("""
+                    INSERT OR REPLACE INTO raw_records 
+                    (record_id, source_name, source_url, as_of_date, published_at, ingested_at, quality_status, data_version, raw_hash, payload)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, [
+                    prov["record_id"], prov["source_name"], prov["source_url"],
+                    prov["as_of_date"], prov["published_at"], prov["ingested_at"],
+                    prov["quality_status"], prov["data_version"], prov["raw_hash"],
+                    s["raw_payload"]
+                ])
+                stats["raw_records"] += 1
+
+                conn.execute("""
+                    INSERT OR REPLACE INTO tech_training_samples
+                    (sample_id, topic_id, base_date, published_at, velocity_1y, acceleration, active_institutions, github_momentum, macro_multiplier, entropy_score, novelty_score, target_1y, target_3y, target_5y, quality_status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, [
+                    s["sample_id"], s["topic_id"], s["base_date"], s["published_at"],
+                    s["velocity_1y"], s["acceleration"], s["active_institutions"],
+                    s["github_momentum"], s["macro_multiplier"], s["entropy_score"],
+                    s["novelty_score"], s["target_1y"], s["target_3y"], s["target_5y"],
+                    s["quality_status"]
+                ])
+                stats["tech_training_samples"] += 1
+
+            if verbose:
+                print(f" -> Ingested {len(tech_samples)} tech training samples.")
+                print(f"[Finished] Full Ingestion Complete! Stats: {stats}")
 
         finally:
             conn.close()

@@ -478,12 +478,20 @@ elif menu == "11. 数据源与模型管理":
     st.markdown("记录所有原始数据哈希签名、版本审计记录与 Point-in-Time 物理隔离状态。")
 
     st.markdown("### 数据库各核心表记录概览")
-    tables = ["raw_records", "tech_metrics", "macro_indicators", "company_financials", "model_forecasts", "model_alerts", "backtest_runs"]
+    tables = [
+        "raw_records", "tech_metrics", "macro_indicators", "company_financials",
+        "company_distress_cohort", "tech_training_samples",
+        "model_forecasts", "model_alerts", "backtest_runs"
+    ]
     table_stats = []
     for t in tables:
         cnt = db_manager.query_df(f"SELECT COUNT(*) as c FROM {t}").iloc[0]["c"]
         table_stats.append({"表名": t, "记录行数": cnt, "存储格式": "DuckDB Columnar / Parquet"})
     st.table(pd.DataFrame(table_stats))
+
+    st.markdown("### P1-01 真实企业违约与存续队列抽样 (Cox PH 训练底座)")
+    df_cohort = db_manager.query_df("SELECT company_id, company_name, industry_sector, duration_months, is_distressed, distress_type, debt_ratio, gross_margin, official_announcement_id FROM company_distress_cohort LIMIT 10")
+    st.dataframe(df_cohort, use_container_width=True)
 
     st.markdown("### 数据质量与验证状态分布 (DataQualityStatus Audit)")
     df_quality = db_manager.query_df("SELECT quality_status, COUNT(*) as record_count FROM raw_records GROUP BY quality_status")

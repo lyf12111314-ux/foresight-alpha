@@ -40,6 +40,19 @@ class OpportunityPoolManager:
         self.asset_mapper = LegalAssetMapper()
         self.synthesizer = MultiModelDecisionSynthesizer()
 
+    def train_models_on_historical_data(self) -> Dict[str, Any]:
+        """使用真实历史数据集训练预测与生存模型 (P1-01 训练管道)
+        
+        执行真实多期前沿技术时序与真实A股违约/存续队列训练，
+        使 LightGBMGrowthForecaster 与 CompanySurvivalEngine 达到 TRAINED 状态。
+        """
+        lgbm_res = self.lgbm_forecaster.fit_from_historical_tech_samples()
+        surv_res = self.survival_engine.fit_from_historical_cohort()
+        return {
+            "lgbm_growth_forecaster": lgbm_res,
+            "company_survival_engine": surv_res
+        }
+
     def build_opportunity_pool(self, cutoff_date: Optional[date] = None) -> List[Dict[str, Any]]:
         """构建机会候选池，执行真实性准入审计并持久化到 model_forecasts"""
         if cutoff_date is None:
@@ -117,7 +130,7 @@ class OpportunityPoolManager:
                 # 仅当机器学习预测器完成真实验证训练时才提取多期点估计
                 growth_mult = None
                 growth_multiples = None
-                if forecaster_pred.get("status") == ModelTrainingStatus.TRAINED.value and forecaster_pred.get("forecasts"):
+                if forecaster_pred.get("status") in [PredictionStatus.PREDICTED.value, "PREDICTED"] and forecaster_pred.get("forecasts"):
                     f3y = forecaster_pred["forecasts"].get("3y", {})
                     growth_mult = f3y.get("point_estimate")
                     growth_multiples = {

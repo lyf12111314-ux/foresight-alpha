@@ -87,6 +87,33 @@ class LightGBMGrowthForecaster:
         """兼容性训练接口 (严格拒绝空样本自动模拟训练)"""
         return self.fit_verified(features, labels_by_horizon if labels_by_horizon else {})
 
+    def fit_from_historical_tech_samples(self) -> Dict[str, Any]:
+        """从历史持久化或采集的真实多期前沿技术样本中加载并训练 LightGBM 多期预测模型 (P1-01 真实训练接口)"""
+        from src.core.database import db_manager
+        df_samples = None
+        try:
+            df_samples = db_manager.query_df("SELECT * FROM tech_training_samples")
+        except Exception:
+            pass
+
+        if df_samples is None or df_samples.empty:
+            from src.ingestion.tech_dataset import HistoricalTechDatasetCollector
+            collector = HistoricalTechDatasetCollector()
+            records = collector.get_historical_tech_training_samples()
+            df_samples = pd.DataFrame(records)
+
+        feature_cols = [
+            "velocity_1y", "acceleration", "active_institutions",
+            "github_momentum", "macro_multiplier", "entropy_score", "novelty_score"
+        ]
+        X = df_samples[feature_cols].values
+        labels_by_horizon = {
+            1: df_samples["target_1y"].values,
+            3: df_samples["target_3y"].values,
+            5: df_samples["target_5y"].values
+        }
+        return self.fit_verified(features=X, labels_by_horizon=labels_by_horizon)
+
     def train_on_synthetic_for_testing(self, n_samples: int = 300) -> Dict[str, Any]:
         """【仅供测试与算法演练使用】基于合成特征测试 LightGBM 算法收敛性"""
         from tests.helpers.synthetic_diffusion import generate_synthetic_diffusion_samples

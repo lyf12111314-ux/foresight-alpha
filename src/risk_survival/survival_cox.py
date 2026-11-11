@@ -96,6 +96,30 @@ class CompanySurvivalEngine:
         """兼容性接口 (拒绝无数据自动模拟训练)"""
         return self.fit_verified(cohort_df)
 
+    def fit_from_historical_cohort(self) -> Dict[str, Any]:
+        """从历史持久化或采集的真实 A 股企业违约队列中加载并训练 Cox 比例风险模型 (P1-01 真实训练接口)"""
+        from src.core.database import db_manager
+        df_cohort = None
+        try:
+            df_cohort = db_manager.query_df("SELECT * FROM company_distress_cohort")
+        except Exception:
+            pass
+
+        if df_cohort is None or df_cohort.empty:
+            from src.ingestion.enterprise import EnterpriseCollector
+            collector = EnterpriseCollector()
+            records = collector.get_historical_distress_cohort()
+            df_cohort = pd.DataFrame(records)
+
+        if "duration" not in df_cohort.columns and "duration_months" in df_cohort.columns:
+            df_cohort["duration"] = df_cohort["duration_months"]
+        if "event" not in df_cohort.columns and "is_distressed" in df_cohort.columns:
+            df_cohort["event"] = df_cohort["is_distressed"]
+
+        needed_cols = ["duration", "event", "cash_burn_months", "debt_ratio", "gross_margin", "competitor_count"]
+        train_df = df_cohort[needed_cols].copy()
+        return self.fit_verified(train_df, duration_col="duration", event_col="event")
+
     def fit_synthetic_for_testing(self, n_samples: int = 250) -> Dict[str, Any]:
         """【仅供测试与算法演练使用】使用模拟数据测试 Cox 算法与 Kaplan-Meier 逻辑"""
         from tests.helpers.synthetic_survival import generate_synthetic_survival_cohort

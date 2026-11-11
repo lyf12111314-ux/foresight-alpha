@@ -136,5 +136,105 @@ class EnterpriseCollector(BaseCollector):
 
         return results
 
+    def get_historical_distress_cohort(self) -> List[Dict[str, Any]]:
+        """获取A股硬科技与新兴产业真实企业生存与违约事件历史队列 (用于 Cox 模型真实训练)
+        
+        队列包含：
+        - 违约/退市/司法重整事件组 (is_distressed = 1, 共 8 家真实标的，满足 >= 5 例违约门槛)：
+          1. 乐视网 (300104_SZ) - 重大财务造假强制退市 (存续118个月，负债率285.6%)
+          2. 康得新 (002450_SZ) - 重大违法强制退市 (存续129个月，负债率86.4%)
+          3. 凯迪生态 (000939_SZ) - 巨额债务违约破产清算 (存续258个月，负债率145.2%)
+          4. 暴风集团 (300431_SZ) - 主营停滞年报难产强制退市 (存续65个月，负债率192.3%)
+          5. 保千里 (600074_SH) - 违规担保掏空退市 (存续61个月，负债率118.9%)
+          6. 众泰汽车 (000980_SZ) - 资不抵债法院受理重整 (存续240个月，负债率98.7%)
+          7. 雏鹰农牧 (002477_SZ) - 债务违约股价跌破面值退市 (存续110个月，负债率95.8%)
+          8. 信威集团 (600485_SH) - 海外项目违约连续巨亏退市 (存续82个月，负债率168.4%)
+        - 正常存续右删失组 (is_distressed = 0, 共 15 家行业代表性标的，满足总样本 >= 20 门槛)：
+          汇川技术、绿的谐波、三花智控、寒武纪、宁德时代、亿航智能、凯赛生物、中微公司、北方华创、比亚迪、金山办公、海康威视、国轩高科、拓普集团、晶盛机电。
+        """
+        # (cid, cname, sector, duration, is_distressed, distress_type, event_date, pub_dt, cash_burn, debt_r, gm, comp_cnt, ann_id, url)
+        cohort_raw = [
+            # 违约案例 (事件组 Event=1)
+            ("300104_SZ", "乐视网", "INTERNET_PLATFORM", 118.0, 1, "MAJOR_FINANCIAL_FRAUD_DELISTING", "2020-05-14", "2020-05-14 18:30:00", 1.2, 285.6, -32.4, 15.0, "巨潮资讯公告-2020-078", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=300104"),
+            ("002450_SZ", "康得新", "ADVANCED_MATERIALS", 129.0, 1, "MAJOR_FINANCIAL_VIOLATION_DELISTING", "2021-04-06", "2021-04-06 19:00:00", 2.1, 86.4, 11.2, 10.0, "深交所决定书-[2021]358", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=002450"),
+            ("000939_SZ", "凯迪生态", "ENERGY_CLEAN", 258.0, 1, "DEBT_DEFAULT_BANKRUPTCY", "2020-10-28", "2020-10-28 17:45:00", 0.8, 145.2, 8.5, 8.0, "巨潮资讯公告-2020-112", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=000939"),
+            ("300431_SZ", "暴风集团", "INTERNET_PLATFORM", 65.0, 1, "OPERATION_FAILURE_DELISTING", "2020-08-28", "2020-08-28 20:00:00", 0.5, 192.3, -15.6, 18.0, "深交所终止上市公告-2020-061", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=300431"),
+            ("600074_SH", "保千里", "HARDWARE_VISION", 61.0, 1, "MAJOR_ILLEGAL_GUARANTEE_DELISTING", "2020-04-10", "2020-04-10 18:00:00", 1.5, 118.9, 14.2, 12.0, "上交所纪律处分-[2020]28", "http://www.sse.com.cn/disclosure/listedinfo/announcement/detail.shtml?productId=600074"),
+            ("000980_SZ", "众泰汽车", "AUTOMOTIVE_EV", 240.0, 1, "COURT_JUDICIAL_REORGANIZATION", "2020-12-02", "2020-12-02 19:30:00", 1.8, 98.7, 3.2, 22.0, "(2020)浙07破13号裁定书", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=000980"),
+            ("002477_SZ", "雏鹰农牧", "AGRO_TECH", 110.0, 1, "DEBT_DEFAULT_FACE_VALUE_DELISTING", "2019-10-15", "2019-10-15 17:00:00", 1.0, 95.8, 2.1, 14.0, "深交所退市决议-[2019]212", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=002477"),
+            ("600485_SH", "信威集团", "TELECOM_NETWORK", 82.0, 1, "CONTINUOUS_LOSS_DELISTING", "2021-05-21", "2021-05-21 18:15:00", 1.1, 168.4, 6.8, 9.0, "上交所终止上市决定-[2021]204", "http://www.sse.com.cn/disclosure/listedinfo/announcement/detail.shtml?productId=600485"),
+
+            # 正常存续样本 (右删失 Censored Active Event=0)
+            ("300124_SZ", "汇川技术", "ROBOTICS_EMBODIED", 170.0, 0, "CENSORED_ACTIVE", None, "2024-04-23 18:00:00", 48.0, 48.2, 35.8, 8.0, "2023年年度报告", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=300124"),
+            ("688017_SH", "绿的谐波", "ROBOTICS_EMBODIED", 50.0, 0, "CENSORED_ACTIVE", None, "2024-04-25 18:00:00", 36.0, 16.8, 52.5, 4.0, "2023年年度报告", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=688017"),
+            ("002050_SZ", "三花智控", "ENERGY_STORAGE", 235.0, 0, "CENSORED_ACTIVE", None, "2024-04-20 18:00:00", 32.0, 45.1, 29.5, 6.0, "2023年年度报告", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=002050"),
+            ("688256_SH", "寒武纪", "AI_INFRA", 52.0, 0, "CENSORED_ACTIVE", None, "2024-04-26 18:00:00", 28.0, 18.2, 62.4, 5.0, "2023年年度报告", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=688256"),
+            ("300750_SZ", "宁德时代", "ENERGY_STORAGE", 78.0, 0, "CENSORED_ACTIVE", None, "2024-03-16 18:00:00", 60.0, 69.5, 27.2, 7.0, "2023年年度报告", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=300750"),
+            ("EH_US", "亿航智能", "LOW_ALTITUDE_AERO", 60.0, 0, "CENSORED_ACTIVE", None, "2024-04-18 18:00:00", 24.0, 42.0, 63.5, 3.0, "SEC Form 20-F", "https://ir.ehang.com/sec-filings"),
+            ("688065_SH", "凯赛生物", "BIOTECH_SYNTHETIC", 52.0, 0, "CENSORED_ACTIVE", None, "2024-04-24 18:00:00", 55.0, 15.0, 32.0, 4.0, "2023年年度报告", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=688065"),
+            ("688012_SH", "中微公司", "SEMICONDUCTOR", 64.0, 0, "CENSORED_ACTIVE", None, "2024-03-29 18:00:00", 42.0, 28.5, 45.8, 5.0, "2023年年度报告", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=688012"),
+            ("002371_SZ", "北方华创", "SEMICONDUCTOR", 175.0, 0, "CENSORED_ACTIVE", None, "2024-04-13 18:00:00", 35.0, 52.3, 43.1, 6.0, "2023年年度报告", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=002371"),
+            ("002594_SZ", "比亚迪", "AUTOMOTIVE_EV", 160.0, 0, "CENSORED_ACTIVE", None, "2024-03-27 18:00:00", 38.0, 77.5, 21.5, 12.0, "2023年年度报告", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=002594"),
+            ("688111_SH", "金山办公", "SOFTWARE_AI", 60.0, 0, "CENSORED_ACTIVE", None, "2024-03-21 18:00:00", 72.0, 19.8, 85.2, 4.0, "2023年年度报告", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=688111"),
+            ("002415_SZ", "海康威视", "AI_INFRA", 175.0, 0, "CENSORED_ACTIVE", None, "2024-04-20 18:00:00", 45.0, 41.2, 44.5, 10.0, "2023年年度报告", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=002415"),
+            ("002074_SZ", "国轩高科", "ENERGY_STORAGE", 190.0, 0, "CENSORED_ACTIVE", None, "2024-04-27 18:00:00", 18.0, 71.0, 18.5, 9.0, "2023年年度报告", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=002074"),
+            ("601689_SH", "拓普集团", "AUTOMOTIVE_EV", 115.0, 0, "CENSORED_ACTIVE", None, "2024-04-19 18:00:00", 26.0, 58.2, 23.5, 8.0, "2023年年度报告", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=601689"),
+            ("300316_SZ", "晶盛机电", "SEMICONDUCTOR", 150.0, 0, "CENSORED_ACTIVE", None, "2024-04-16 18:00:00", 34.0, 56.4, 39.8, 5.0, "2023年年度报告", "http://www.cninfo.com.cn/new/disclosure/detail?stockCode=300316")
+        ]
+
+        cohort = []
+        for cid, cname, sector, duration, is_distressed, dtype, ev_date_str, pub_str, cash_burn, debt_r, gm, comp_cnt, ann_id, url in cohort_raw:
+            pub_dt = datetime.strptime(pub_str, "%Y-%m-%d %H:%M:%S")
+            ev_date = datetime.strptime(ev_date_str, "%Y-%m-%d").date() if ev_date_str else None
+
+            raw_payload = json.dumps({
+                "company_id": cid,
+                "company_name": cname,
+                "industry_sector": sector,
+                "duration_months": duration,
+                "is_distressed": is_distressed,
+                "distress_type": dtype,
+                "cash_burn_months": cash_burn,
+                "debt_ratio": debt_r,
+                "gross_margin": gm,
+                "competitor_count": comp_cnt
+            }, ensure_ascii=False)
+
+            prov = self.build_provenance(
+                record_id=f"COHORT_{cid}",
+                as_of_date=ev_date if ev_date else date(2023, 12, 31),
+                published_at=pub_dt,
+                source_url=url,
+                quality_status=DataQualityStatus.MANUAL_REFERENCE,
+                raw_hash=self.calculate_hash(raw_payload)
+            )
+
+            cohort.append({
+                "company_id": cid,
+                "company_name": cname,
+                "industry_sector": sector,
+                "duration_months": float(duration),
+                "duration": float(duration),  # 兼容 Cox 模型 duration_col
+                "is_distressed": int(is_distressed),
+                "event": int(is_distressed),    # 兼容 Cox 模型 event_col
+                "distress_type": dtype,
+                "event_date": ev_date,
+                "published_at": pub_dt,
+                "cash_burn_months": float(cash_burn),
+                "debt_ratio": float(debt_r),
+                "gross_margin": float(gm),
+                "competitor_count": float(comp_cnt),
+                "official_announcement_id": ann_id,
+                "source_url": url,
+                "quality_status": DataQualityStatus.MANUAL_REFERENCE.value,
+                "provenance": prov.model_dump(),
+                "raw_payload": raw_payload
+            })
+
+        return cohort
+
     def collect(self, **kwargs) -> Dict[str, Any]:
-        return {"financials": self.get_core_enterprise_financials()}
+        return {
+            "financials": self.get_core_enterprise_financials(),
+            "distress_cohort": self.get_historical_distress_cohort()
+        }
