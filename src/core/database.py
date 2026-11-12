@@ -165,7 +165,14 @@ class DatabaseManager:
                     brier_score DOUBLE,
                     excess_vs_random DOUBLE,
                     excess_vs_momentum DOUBLE,
-                    created_at TIMESTAMP NOT NULL
+                    created_at TIMESTAMP NOT NULL,
+                    backtest_type VARCHAR DEFAULT 'ML_PREDICTION_BACKTEST',
+                    forecast_status VARCHAR,
+                    historical_model_version VARCHAR,
+                    dataset_version VARCHAR,
+                    evaluable_sample_count INTEGER,
+                    unevaluable_sample_count INTEGER,
+                    validation_status VARCHAR
                 );
             """)
 
@@ -336,7 +343,28 @@ class DatabaseManager:
                         _record_migration(m_id, "v1.1-p0", f"Add column {col} failed", "FAILED", str(e))
                         raise RuntimeError(f"Database migration failed adding column {col}: {e}")
 
-            # 4. 迁移后模式完整性校验 (Post-Migration Schema Integrity Check)
+            # 4. 迁移 backtest_runs 补充回测类型、模型版本与样本审计字段
+            for col, dtype in [
+                ("backtest_type", "VARCHAR DEFAULT 'ML_PREDICTION_BACKTEST'"),
+                ("forecast_status", "VARCHAR"),
+                ("historical_model_version", "VARCHAR"),
+                ("dataset_version", "VARCHAR"),
+                ("evaluable_sample_count", "INTEGER"),
+                ("unevaluable_sample_count", "INTEGER"),
+                ("validation_status", "VARCHAR")
+            ]:
+                m_id = f"mig_backtest_add_{col}"
+                try:
+                    conn.execute(f"ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS {col} {dtype};")
+                    _record_migration(m_id, "v1.1-p0", f"Add column {col} to backtest_runs", "SUCCESS")
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "already exists" in err_str:
+                        _record_migration(m_id, "v1.1-p0", f"Column {col} already exists", "ALREADY_APPLIED", str(e))
+                    else:
+                        _record_migration(m_id, "v1.1-p0", f"Add column {col} failed", "FAILED", str(e))
+
+            # 5. 迁移后模式完整性校验 (Post-Migration Schema Integrity Check)
             self._verify_post_migration_integrity(conn)
 
         finally:
@@ -416,7 +444,31 @@ class DatabaseManager:
         if target_col and target_val:
             sql += f" AND {target_col} = ?"
             params.append(target_val)
-        sql += " ORDER BY as_of_date ASC"
+
+        if require_verified_timestamp:
+            try:
+                cols_info = self.query_df(f"PRAGMA table_info('{table_name}')")
+                col_names = cols_info["name"].tolist() if not cols_info.empty else []
+                if "quality_status" in col_names:
+                    sql += " AND quality_status = 'VERIFIED'"
+                elif "is_verified" in col_names:
+                    sql += " AND (is_verified = TRUE OR is_verified = 1)"
+                else:
+                    # 表中无数据质量/核验标识，在严格校验下拒绝未核验时序数据
+                    sql += " AND 1 = 0"
+            except Exception:
+                pass
+
+        try:
+            cols_info = self.query_df(f"PRAGMA table_info('{table_name}')")
+            col_names = cols_info["name"].tolist() if not cols_info.empty else []
+            if "as_of_date" in col_names:
+                sql += " ORDER BY as_of_date ASC"
+            elif "base_date" in col_names:
+                sql += " ORDER BY base_date ASC"
+        except Exception:
+            pass
+
         return self.query_df(sql, params)
 
 

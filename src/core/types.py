@@ -56,6 +56,12 @@ class SimulationType(str, Enum):
     EXPERIMENTAL_RESEARCH = "EXPERIMENTAL_RESEARCH"                 # 实验性研究估算
 
 
+class BacktestType(str, Enum):
+    """历史回测类型 (严格隔离机器学习预测回测与规则研究排序回测)"""
+    ML_PREDICTION_BACKTEST = "ML_PREDICTION_BACKTEST"               # 机器学习模型预测回测
+    RESEARCH_RANKING_BACKTEST = "RESEARCH_RANKING_BACKTEST"         # 规则研究排序回测
+
+
 class ModelStage(str, Enum):
     """模型开发与验证阶段 (V1.1 准入门禁标准)"""
     UNTRAINED = "UNTRAINED"                         # 未训练
@@ -118,6 +124,21 @@ class OOSValidationDataset(BaseModel):
     audit_status: DataQualityStatus = DataQualityStatus.UNVERIFIED
     samples: List[OOSValidationSample] = Field(default_factory=list)
     source_archive: str = "Independent_OOS_Audit_Vault"
+    is_synthetic: bool = False
+    is_registered: bool = False
+    checksum_sha256: Optional[str] = None
+
+
+class TrustedDatasetRegistration(BaseModel):
+    """可信注册验证数据集定义 (P0-01 准入审计规范)"""
+    dataset_id: str
+    dataset_version: str
+    audit_status: DataQualityStatus = DataQualityStatus.VERIFIED
+    registered_at: datetime = Field(default_factory=datetime.utcnow)
+    description: str = "经独立审计的真实历史样本外验证数据集"
+    samples: List[OOSValidationSample] = Field(default_factory=list)
+    checksum_sha256: str = ""
+    audit_authority: str = "Independent_OOS_Audit_Authority"
     is_synthetic: bool = False
 
 
@@ -311,9 +332,16 @@ class BacktestMetricRecord(BaseModel):
     backtest_cutoff_date: date
     evaluation_date: date
     target_horizon_years: int
-    precision_at_k: Dict[int, float]         # {3: 0.67, 5: 0.60}
-    recall_at_k: Dict[int, float]
-    pr_auc: float
-    brier_score: float                       # 概率校准误差 (越低越好)
-    excess_hit_rate_vs_random: float         # 相对随机基准的超额命中率
-    excess_hit_rate_vs_momentum: float       # 相对简单动量基准的超额命中率
+    precision_at_k: Optional[Dict[int, Optional[float]]] = None         # {3: 0.67, 5: 0.60}
+    recall_at_k: Optional[Dict[int, Optional[float]]] = None
+    pr_auc: Optional[float] = None
+    brier_score: Optional[float] = None                       # 概率校准误差 (越低越好)
+    excess_hit_rate_vs_random: Optional[float] = None         # 相对随机基准的超额命中率
+    excess_hit_rate_vs_momentum: Optional[float] = None       # 相对简单动量基准的超额命中率
+    backtest_type: BacktestType = BacktestType.ML_PREDICTION_BACKTEST
+    forecast_status: Optional[str] = None
+    historical_model_version: Optional[str] = None
+    dataset_version: Optional[str] = None
+    evaluable_sample_count: Optional[int] = None
+    unevaluable_sample_count: Optional[int] = None
+    validation_status: Optional[str] = None

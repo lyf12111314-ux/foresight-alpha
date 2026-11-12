@@ -380,12 +380,14 @@ class CompanySurvivalEngine:
 
     def predict_company_survival(
         self,
-        company_metrics: Dict[str, float]
+        company_metrics: Dict[str, float],
+        is_formal: bool = False
     ) -> Dict[str, Any]:
         """评估特定企业生存概率与危险比率。
         
         若模型未训练或未通过真实验证，严禁输出虚构破产概率。
         若模型处于 EXPERIMENTAL 实验阶段，返回 UNVERIFIED_RESEARCH 且 is_verified 严格为 False。
+        若进行正式预测 (is_formal=True 或 VERIFIED_PRODUCTION)，所有协变量必须具备真实数据，严禁默认值填充。
         """
         if not self.is_algorithm_fitted or not self.is_fitted:
             return {
@@ -408,8 +410,13 @@ class CompanySurvivalEngine:
             }
 
         # 严格检查核心财务与经营协变量完整性 (严禁在财务数据缺失时使用默认数值填充替代)
-        financial_covariates = ["debt_ratio", "gross_margin"]
-        missing_covs = [c for c in financial_covariates if c not in company_metrics or company_metrics[c] is None]
+        is_formal_prediction = bool(is_formal or self.model_stage == ModelStage.VERIFIED_PRODUCTION)
+        if is_formal_prediction:
+            required_covariates = ["cash_burn_months", "debt_ratio", "gross_margin", "competitor_count"]
+        else:
+            required_covariates = ["debt_ratio", "gross_margin"]
+
+        missing_covs = [c for c in required_covariates if c not in company_metrics or company_metrics[c] is None]
         if missing_covs:
             return {
                 "status": PredictionStatus.INSUFFICIENT_DATA.value,
@@ -425,9 +432,9 @@ class CompanySurvivalEngine:
                     "surv_3y": None,
                     "surv_5y": None
                 },
-                "risk_assessment": f"企业关键财务指标缺失 ({missing_covs})，拒绝使用默认数值填充，以保证风险评估可信度。",
+                "risk_assessment": f"企业关键财务与经营指标缺失 ({missing_covs})，正式预测拒绝使用默认数值填充以保证风险评估可信度。",
                 "hazard_factor_multipliers": {},
-                "disclaimer": "财务数据缺失时拒绝输出企业破产预测以维护决策可信度。"
+                "disclaimer": "指标缺失时拒绝输出企业破产预测以维护决策可信度。"
             }
 
         sample_df = pd.DataFrame([{

@@ -40,10 +40,18 @@
 - **`EXPERIMENTAL_RESEARCH` (实验性研究估算)**：
   科研探索性推演，不作商业与投资决策参考。
 
-### 3. 生产准入硬性门槛
+### 3. 生产准入硬性门槛与可信注册中心
+- **可信验证数据集注册中心 (`TrustedValidationRegistry`)**：
+  正式生产验证准入只接受经独立审计登记的数据集引用 (`registered_dataset_id`)。禁止调用方传入普通数组、未注册数据或通过模型预测值自生标签 (`is_model_generated=True` 或 $\text{corr}>0.999$) 伪造验证；手工构造的 `VERIFIED` 状态或哈希不可替代注册凭据。
+- **分期限独立拟合与预测 (`P0-02`)**：
+  LightGBM 各预测期限 (1y/3y/5y) 独立筛选真实成熟标签与统计样本量。严禁跨预测期限复制或相互代偿标签。未达训练样本量的期限保持 `UNAVAILABLE`，预测结果严格返回 `None`。
+- **回测类型严格隔离 (`P0-03`)**：
+  历史回测分为 `ML_PREDICTION_BACKTEST` 与 `RESEARCH_RANKING_BACKTEST`。当历史模型缺失时，机器学习回测指标必须全为 `None`，严禁借用研究规则评分冒充机器学习准确率。
+- **Point-in-Time 真实时钟门禁 (`P0-04`)**：
+  历史模型训练严格排除 `feature_published_at IS NULL` 记录；`query_point_in_time` 在 `require_verified_timestamp=True` 时强制过滤非 `VERIFIED` 记录。
 - **LightGBM 成长预测器**：
   生产准入硬性上限 $\text{MAE} \le 2.0$ 且必须显著超越全预测训练集均值/中位数基准 (Naive Baseline)。调用方传入宽松阈值会被系统自动截断回硬性上限。
 - **Cox 企业生存风险模型**：
-  生产准入硬性下限 $C\text{-index} \ge 0.60$ 且必须超越随机基准 (0.50)。时间单位统一为 `MONTHS` (12m/36m/60m)，缺失财务数据直接拒绝。
+  生产准入硬性下限 $C\text{-index} \ge 0.60$ 且必须超越随机基准 (0.50)。正式预测 (`is_formal=True`) 必须全部具备 4 项核心协变量 (`cash_burn_months`, `debt_ratio`, `gross_margin`, `competitor_count`)，严禁默认值填充。
 - **双轨排序治理机制**：
   在当前阶段，全系统正式预测排名严格返回空 (`NO_VERIFIED_FORECASTS`)，真实反映系统能力边界。

@@ -13,13 +13,14 @@
 
 import json
 from datetime import date, datetime
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Union
 import pandas as pd
 import numpy as np
 
 from src.core.database import db_manager
 from src.core.types import (
     BacktestMetricRecord,
+    BacktestType,
     GroundTruthOutcome,
     PredictionStatus,
     ModelTrainingStatus,
@@ -41,8 +42,9 @@ class PointInTimeBacktestEngine:
         try:
             df = db_manager.query_df("""
                 SELECT * FROM tech_training_samples
-                WHERE (feature_published_at IS NULL OR feature_published_at <= ?)
-                  AND (base_date <= ?)
+                WHERE feature_published_at IS NOT NULL
+                  AND feature_published_at <= ?
+                  AND base_date <= ?
             """, [cutoff_date, cutoff_date])
         except Exception:
             return pd.DataFrame()
@@ -50,20 +52,23 @@ class PointInTimeBacktestEngine:
         if df.empty:
             return df
 
-        target_col = f"target_{horizon_years}y"
-        period_end_col = f"label_{horizon_years}y_period_end"
-
-        # 严格过滤成熟标签：若 label_Xy_period_end > cutoff_date，该标签在历史时点尚未发生，置为 None
-        if period_end_col in df.columns:
-            matured_mask = df[period_end_col].notna() & (pd.to_datetime(df[period_end_col]).dt.date <= cutoff_date)
-            df.loc[~matured_mask, target_col] = None
-        else:
-            base_dts = pd.to_datetime(df["base_date"]).dt.date
-            matured = [
-                d is not None and (date(d.year + horizon_years, d.month, min(d.day, 28)) <= cutoff_date)
-                for d in base_dts
-            ]
-            df.loc[~pd.Series(matured, index=df.index), target_col] = None
+        # 对每个预测期限独立过滤成熟标签：若 label_hy_period_end > cutoff_date，该标签在历史时点尚未成熟，置为 None
+        cutoff_dt = pd.to_datetime(cutoff_date)
+        for h in [1, 3, 5]:
+            tgt_c = f"target_{h}y"
+            pend_c = f"label_{h}y_period_end"
+            if tgt_c in df.columns:
+                if pend_c in df.columns:
+                    pend_series = pd.to_datetime(df[pend_c], errors="coerce")
+                    matured_mask = pend_series.notna() & (pend_series <= cutoff_dt)
+                    df.loc[~matured_mask, tgt_c] = None
+                else:
+                    base_dts = pd.to_datetime(df["base_date"], errors="coerce")
+                    matured = [
+                        pd.notna(d) and (pd.Timestamp(date(d.year + h, d.month, min(d.day, 28))) <= cutoff_dt)
+                        for d in base_dts
+                    ]
+                    df.loc[~pd.Series(matured, index=df.index), tgt_c] = None
 
         return df
 
@@ -81,30 +86,28 @@ class PointInTimeBacktestEngine:
             forecaster.rejection_reason = f"历史时点 {cutoff_date.isoformat()} 尚无可获得的成熟训练样本。"
             return forecaster
 
-        valid_df = hist_df[hist_df[target_col].notna()].copy()
-        if len(valid_df) < 5:
+        # 检查特征列
+        for c in forecaster.feature_names:
+            if c not in hist_df.columns:
+                hist_df[c] = 0.0
+
+        # 分期限提取独立真实标签，严禁跨期限互相复制或替代 (P0-02 铁律)
+        labels = {}
+        for h in [1, 3, 5]:
+            h_col = f"target_{h}y"
+            if h_col in hist_df.columns:
+                labels[h] = hist_df[h_col].values
+
+        # 检查目标期限是否有足够成熟样本 (最低要求 5 条真实成熟样本)
+        target_valid_count = int(np.sum(pd.notna(labels.get(horizon_years, [])) & [y is not None for y in labels.get(horizon_years, [])]))
+        if target_valid_count < 5:
             forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
             forecaster.model_stage = ModelStage.UNTRAINED
-            forecaster.rejection_reason = f"历史时点 {cutoff_date.isoformat()} 可用成熟样本不足 ({len(valid_df)} < 5)，无法拟合历史模型。"
+            forecaster.rejection_reason = f"历史时点 {cutoff_date.isoformat()} {horizon_years}年期可用成熟样本不足 ({target_valid_count} < 5)，无法拟合历史模型。"
             return forecaster
 
-        # 提取特征与多期限标签
-        for c in forecaster.feature_names:
-            if c not in valid_df.columns:
-                valid_df[c] = 0.0
-
-        X = valid_df[forecaster.feature_names]
-        labels = {horizon_years: valid_df[target_col].values}
-        for h in [1, 3, 5]:
-            if h != horizon_years:
-                h_col = f"target_{h}y"
-                if h_col in valid_df.columns and valid_df[h_col].notna().sum() == len(valid_df):
-                    labels[h] = valid_df[h_col].values
-                else:
-                    labels[h] = valid_df[target_col].values
-
         forecaster.fit_experimental(
-            features=X,
+            features=hist_df[forecaster.feature_names],
             labels_by_horizon=labels,
             dataset_version=f"pit_hist_{cutoff_date.strftime('%Y%m%d')}"
         )
@@ -115,11 +118,15 @@ class PointInTimeBacktestEngine:
         cutoff_date: date = date(2021, 12, 31),
         evaluation_date: date = date(2024, 12, 31),
         horizon_years: int = 3,
-        audit_as_of_date: Optional[date] = None
+        audit_as_of_date: Optional[date] = None,
+        backtest_type: Union[BacktestType, str] = BacktestType.ML_PREDICTION_BACKTEST
     ) -> Dict[str, Any]:
         """在历史切片点 cutoff_date 独立训练历史模型并运行预测，在 evaluation_date 核验真实结果"""
-        run_id = f"BT_{cutoff_date.strftime('%Y%m%d')}_{evaluation_date.strftime('%Y%m%d')}"
-        review_audit_date = audit_as_of_date or date(2026, 11, 11)
+        b_type = BacktestType(backtest_type) if isinstance(backtest_type, str) else backtest_type
+        today = date.today()
+        # 审计日期默认取当前实际日期，且不能设置为未来日期 (杜绝前视泄漏)
+        review_audit_date = min(audit_as_of_date or today, today)
+        run_id = f"BT_{b_type.value[:2]}_{cutoff_date.strftime('%Y%m%d')}_{evaluation_date.strftime('%Y%m%d')}_{horizon_years}y"
 
         # 1. 独立训练截至 cutoff_date 的历史时点模型 (物理隔离未来模型权重与未来数据)
         hist_forecaster = self.train_historical_forecaster(cutoff_date, horizon_years)
@@ -128,9 +135,11 @@ class PointInTimeBacktestEngine:
         # 在 cutoff_date 生成当时的预测候选池
         candidates = pool_manager.build_opportunity_pool(cutoff_date=cutoff_date)
 
-        # 预测得分元组列表 [(topic_id, research_score)]
-        predicted_scores = [(c["topic_id"], c.get("research_score", c.get("composite_score", 0.0))) for c in candidates]
-        predicted_probs = [c.get("calibrated_probability") for c in candidates]
+        is_ml_backtest = (b_type == BacktestType.ML_PREDICTION_BACKTEST)
+        ml_model_unavailable = (
+            hist_forecaster.training_status == ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+            or horizon_years not in hist_forecaster.models
+        )
 
         # 2. 从真实历史数据中提取事实标签 (Ground Truth Outcome)
         try:
@@ -186,28 +195,81 @@ class PointInTimeBacktestEngine:
                 "is_evaluable": self.calc._is_evaluable(outcome)
             }
 
-        # 3. 计算评估指标 (排除未成熟与证据不足样本)
-        prec_3 = self.calc.precision_at_k(predicted_scores, true_labels, k=3, filter_evaluable_only=True)
-        prec_5 = self.calc.precision_at_k(predicted_scores, true_labels, k=min(5, len(predicted_scores)), filter_evaluable_only=True)
-        rec_5 = self.calc.recall_at_k(predicted_scores, true_labels, k=min(5, len(predicted_scores)))
-        real_pr_auc = self.calc.pr_auc(predicted_scores, true_labels)
+        evaluable_sample_count = sum(1 for d in outcome_details.values() if d.get("is_evaluable"))
+        unevaluable_sample_count = len(candidates) - evaluable_sample_count
 
-        evaluable_probs = []
-        evaluable_actuals = []
-        for item, p in zip(predicted_scores, predicted_probs):
-            ot = true_labels.get(item[0])
-            if self.calc._is_evaluable(ot):
-                evaluable_probs.append(p)
-                evaluable_actuals.append(1 if self.calc._is_positive(ot) else 0)
+        # 3. 计算与隔离评估指标 (P0-03: 严格隔离机器学习与规则研究)
+        if is_ml_backtest:
+            if ml_model_unavailable:
+                forecast_status = PredictionStatus.MODEL_UNAVAILABLE_AS_OF_DATE.value
+                validation_status = "MODEL_UNAVAILABLE"
+                prec_3 = None
+                prec_5 = None
+                rec_5 = None
+                real_pr_auc = None
+                brier = None
+                excess_rates = {
+                    "excess_vs_random": None,
+                    "excess_vs_momentum": None,
+                    "random_baseline": None,
+                    "momentum_baseline": None
+                }
+                predicted_scores = [(c["topic_id"], None) for c in candidates]
+            else:
+                forecast_status = "PREDICTED"
+                validation_status = "VALIDATED"
+                pred_scores = []
+                for c in candidates:
+                    features = c.get("features", {})
+                    pred_res = hist_forecaster.predict_growth(features)
+                    pt = pred_res.get("forecasts", {}).get(f"{horizon_years}y", {}).get("point_estimate")
+                    pred_scores.append((c["topic_id"], pt if pt is not None else 0.0))
+                predicted_scores = pred_scores
+                prec_3 = self.calc.precision_at_k(predicted_scores, true_labels, k=3, filter_evaluable_only=True)
+                prec_5 = self.calc.precision_at_k(predicted_scores, true_labels, k=min(5, len(predicted_scores)), filter_evaluable_only=True)
+                rec_5 = self.calc.recall_at_k(predicted_scores, true_labels, k=min(5, len(predicted_scores)))
+                real_pr_auc = self.calc.pr_auc(predicted_scores, true_labels)
 
-        brier = self.calc.brier_score(evaluable_probs, evaluable_actuals)
+                evaluable_probs = []
+                evaluable_actuals = []
+                for item, c in zip(predicted_scores, candidates):
+                    p = c.get("calibrated_probability")
+                    ot = true_labels.get(item[0])
+                    if self.calc._is_evaluable(ot):
+                        evaluable_probs.append(p)
+                        evaluable_actuals.append(1 if self.calc._is_positive(ot) else 0)
+                brier = self.calc.brier_score(evaluable_probs, evaluable_actuals)
+                excess_rates = self.calc.calculate_excess_hit_rate(
+                    model_precision=prec_3,
+                    candidate_items=candidates,
+                    true_labels=true_labels,
+                    k=3
+                )
+        else:
+            # 规则研究排序回测 (RESEARCH_RANKING_BACKTEST)
+            forecast_status = "RESEARCH_RULE_RANKING"
+            validation_status = "RESEARCH_HEURISTIC"
+            predicted_scores = [(c["topic_id"], c.get("research_score", c.get("composite_score", 0.0))) for c in candidates]
+            prec_3 = self.calc.precision_at_k(predicted_scores, true_labels, k=3, filter_evaluable_only=True)
+            prec_5 = self.calc.precision_at_k(predicted_scores, true_labels, k=min(5, len(predicted_scores)), filter_evaluable_only=True)
+            rec_5 = self.calc.recall_at_k(predicted_scores, true_labels, k=min(5, len(predicted_scores)))
+            real_pr_auc = self.calc.pr_auc(predicted_scores, true_labels)
 
-        excess_rates = self.calc.calculate_excess_hit_rate(
-            model_precision=prec_3,
-            candidate_items=candidates,
-            true_labels=true_labels,
-            k=3
-        )
+            evaluable_probs = []
+            evaluable_actuals = []
+            for item, c in zip(predicted_scores, candidates):
+                p = c.get("calibrated_probability")
+                ot = true_labels.get(item[0])
+                if self.calc._is_evaluable(ot):
+                    evaluable_probs.append(p)
+                    evaluable_actuals.append(1 if self.calc._is_positive(ot) else 0)
+            brier = self.calc.brier_score(evaluable_probs, evaluable_actuals)
+            excess_rates = self.calc.calculate_excess_hit_rate(
+                model_precision=prec_3,
+                candidate_items=candidates,
+                true_labels=true_labels,
+                k=3
+            )
 
         # 4. 持久化回测记录到 DuckDB (版本化不可篡改存储)
         now = datetime.utcnow()
@@ -225,31 +287,31 @@ class PointInTimeBacktestEngine:
 
             conn.execute("""
                 INSERT INTO backtest_runs
-                (run_id, cutoff_date, evaluation_date, horizon_years, precision_3, precision_5, recall_5, pr_auc, brier_score, excess_vs_random, excess_vs_momentum, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                (run_id, cutoff_date, evaluation_date, horizon_years, precision_3, precision_5, recall_5, pr_auc, brier_score, excess_vs_random, excess_vs_momentum, created_at, backtest_type, forecast_status, historical_model_version, dataset_version, evaluable_sample_count, unevaluable_sample_count, validation_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """, [
                 actual_run_id, cutoff_date, evaluation_date, horizon_years,
                 prec_3, prec_5, rec_5, real_pr_auc,
-                brier, excess_rates["excess_vs_random"], excess_rates["excess_vs_momentum"], now
+                brier, excess_rates["excess_vs_random"], excess_rates["excess_vs_momentum"], now,
+                b_type.value, forecast_status, hist_forecaster.model_version, hist_forecaster.dataset_version,
+                evaluable_sample_count, unevaluable_sample_count, validation_status
             ])
         finally:
             conn.close()
 
-        forecast_status = (
-            PredictionStatus.MODEL_UNAVAILABLE_AS_OF_DATE.value
-            if hist_forecaster.training_status == ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
-            else hist_forecaster.training_status.value
-        )
-
         return {
             "run_id": actual_run_id,
+            "backtest_type": b_type.value,
             "cutoff_date": cutoff_date.isoformat(),
             "evaluation_date": evaluation_date.isoformat(),
             "horizon_years": horizon_years,
             "expected_maturity_date": expected_maturity_date.isoformat(),
             "is_horizon_matured": is_matured_horizon,
             "forecast_status": forecast_status,
+            "validation_status": validation_status,
             "historical_model_version": hist_forecaster.model_version,
+            "evaluable_sample_count": evaluable_sample_count,
+            "unevaluable_sample_count": unevaluable_sample_count,
             "metrics": {
                 "precision_at_3": prec_3,
                 "precision_at_5": prec_5,

@@ -176,8 +176,13 @@ class OpportunityPoolManager:
                     and diffusion_res.get("status") == PredictionStatus.PREDICTED.value
                 )
 
+                # 正式收益模拟需同时具备：已验证成长模型 + 经逐笔审计的真实可投资产价格与估值依据
+                # 缺少可核验的资产价格与估值时，严格保持在假设情景推演 (HYPOTHETICAL_SCENARIO)，正式 prob_10x 为 None
+                has_verified_asset_valuation = False
+                is_formal_payoff_eligible = bool(is_lgbm_verified and has_verified_asset_valuation)
+
                 if growth_mult is not None and not np.isnan(growth_mult):
-                    if is_lgbm_verified:
+                    if is_formal_payoff_eligible:
                         payoff_res = self.payoff_engine.simulate_payoff(
                             base_growth_multiplier=growth_mult,
                             current_valuation_multiple=25.0,
@@ -186,7 +191,7 @@ class OpportunityPoolManager:
                             is_verified=True
                         )
                     else:
-                        # 实验性模型预测，严格路由至假设情景推演，正式 prob_10x 为 None
+                        # 实验性模型预测或缺少核验估值，严格路由至假设情景推演，正式 prob_10x 为 None
                         payoff_res = self.payoff_engine.simulate_payoff(
                             base_growth_multiplier=growth_mult,
                             current_valuation_multiple=25.0,

@@ -242,25 +242,42 @@ def test_p0_02_model_promotion_requires_oos_validation():
     assert forecaster.model_stage == ModelStage.BENCHMARK
     assert forecaster.is_out_of_sample_validated is False
 
-    # 样本外检验 (OOS) - 成功达标情形 (提供经核验的独立样本外血缘凭证)
-    oos_provenances = [
-        ProvenanceMetadata(
-            record_id=f"OOS_REC_{i}",
-            source_name="Audited_OOS_Archive",
-            as_of_date=date(2021, 1, 1),
-            published_at=datetime(2021, 1, 2),
-            quality_status=DataQualityStatus.VERIFIED,
-            raw_hash="fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+    # 样本外检验 (OOS) - 成功达标情形 (通过可信注册中心登记独立样本外数据集并进入正式验证)
+    from src.decision_engine.model_validator import TrustedValidationRegistry
+    from src.core.types import TrustedDatasetRegistration, OOSValidationSample
+
+    oos_samples = [
+        OOSValidationSample(
+            sample_id=f"OOS_REC_{i}",
+            dataset_version="v1.1-oos-audited",
+            feature_snapshot_id=f"snap_oos_{i}",
+            decision_date=date(2021, 1, 1),
+            feature_available_at=datetime(2020, 12, 31),
+            label_period_end=date(2022, 1, 1),
+            label_observed_at=datetime(2022, 1, 2),
+            label_source="Audited_OOS_Archive",
+            label_quality_status=DataQualityStatus.VERIFIED,
+            source_record_id=f"rec_oos_{i}",
+            data_quality_status=DataQualityStatus.VERIFIED,
+            features={forecaster.feature_names[j]: float(oos_feat[i][j]) for j in range(7)},
+            labels={
+                1: float(forecaster.models[1].predict(oos_feat)[i] + 0.35),
+                3: float(forecaster.models[3].predict(oos_feat)[i] + 0.35),
+                5: float(forecaster.models[5].predict(oos_feat)[i] + 0.35)
+            }
         )
         for i in range(10)
     ]
-    oos_good_labels = {
-        1: forecaster.models[1].predict(oos_feat) + 0.1,
-        3: forecaster.models[3].predict(oos_feat) + 0.1,
-        5: forecaster.models[5].predict(oos_feat) + 0.1
-    }
-    res_oos_pass = forecaster.validate_out_of_sample(
-        oos_feat, oos_good_labels, max_allowed_mae=2.0, provenance_records=oos_provenances
+    TrustedValidationRegistry.register(TrustedDatasetRegistration(
+        dataset_id="REG_OOS_TECH_REMEDIATION_P0",
+        dataset_version="v1.1-oos-audited",
+        audit_status=DataQualityStatus.VERIFIED,
+        checksum_sha256="fedcba9876543210" * 4,
+        samples=oos_samples
+    ))
+    res_oos_pass = forecaster.validate_formal_production_oos(
+        registered_dataset_id="REG_OOS_TECH_REMEDIATION_P0",
+        max_allowed_mae=2.0
     )
     assert res_oos_pass["passed"] is True
     assert forecaster.model_stage == ModelStage.VERIFIED_PRODUCTION

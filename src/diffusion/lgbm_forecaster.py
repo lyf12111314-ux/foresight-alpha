@@ -155,7 +155,7 @@ class LightGBMGrowthForecaster:
                     "message": reason
                 }
 
-        # 3. 检查每个期限的标签成熟度与完整性
+        # 3. 独立检查每个预测期限的标签成熟度并拟合 (P0-02 分期限独立训练)
         if not labels_by_horizon:
             reason = "缺少多预测期限的标签数据字典。"
             self._reset_to_untrained(reason)
@@ -166,27 +166,47 @@ class LightGBMGrowthForecaster:
                 "message": reason
             }
 
+        trained_horizons = []
+        feat_arr = features.values if hasattr(features, "values") else np.array(features)
         for horizon in [1, 3, 5]:
             if horizon not in labels_by_horizon or len(labels_by_horizon[horizon]) != len(features):
-                reason = f"缺少 {horizon} 年期的有效真实标签数据或长度不匹配。"
-                self._reset_to_untrained(reason)
-                return {
-                    "status": ModelTrainingStatus.MODEL_NOT_TRAINED.value,
-                    "model_stage": self.model_stage.value,
-                    "is_verified": False,
-                    "message": reason
-                }
+                if horizon in self.models:
+                    del self.models[horizon]
+                continue
 
-            reg = lgb.LGBMRegressor(
-                n_estimators=80,
-                learning_rate=0.06,
-                num_leaves=15,
-                max_depth=5,
-                random_state=self.random_state,
-                verbose=-1
-            )
-            reg.fit(features, labels_by_horizon[horizon])
-            self.models[horizon] = reg
+            raw_labels = labels_by_horizon[horizon]
+            valid_mask = pd.notna(raw_labels) & [y is not None for y in raw_labels]
+            valid_count = int(np.sum(valid_mask))
+
+            if valid_count >= self.MIN_REAL_TRAINING_SAMPLES:
+                X_h = feat_arr[valid_mask]
+                y_h = np.array(raw_labels)[valid_mask].astype(float)
+                reg = lgb.LGBMRegressor(
+                    n_estimators=80,
+                    learning_rate=0.06,
+                    num_leaves=15,
+                    max_depth=5,
+                    random_state=self.random_state,
+                    verbose=-1
+                )
+                reg.fit(X_h, y_h)
+                self.models[horizon] = reg
+                trained_horizons.append(horizon)
+            else:
+                if horizon in self.models:
+                    del self.models[horizon]
+
+        if not trained_horizons:
+            reason = f"所有预测期限的有效真实成熟样本均不足 ({self.MIN_REAL_TRAINING_SAMPLES})，模型保持未训练状态。"
+            self._reset_to_untrained(reason)
+            return {
+                "status": ModelTrainingStatus.MODEL_NOT_TRAINED.value,
+                "model_stage": self.model_stage.value,
+                "is_verified": False,
+                "sample_count": self.sample_count,
+                "min_required": self.MIN_REAL_TRAINING_SAMPLES,
+                "message": reason
+            }
 
         # 记录训练样本 ID、窗口与真实标签供独立验证时序与重叠审计
         if provenance_records:
@@ -227,6 +247,20 @@ class LightGBMGrowthForecaster:
             "message": "模型已使用逐项核验的真实验证数据集完成基准训练，待样本外验证 (OOS) 后可晋升为正式生产模型。"
         }
 
+    def validate_formal_production_oos(
+        self,
+        registered_dataset_id: str,
+        evaluation_date: Optional[date] = None,
+        max_allowed_mae: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """正式生产验证准入唯一入口：只接受已在可信注册中心 (TrustedValidationRegistry) 审计登记的数据集引用"""
+        return self.validate_out_of_sample(
+            validation_dataset=registered_dataset_id,
+            evaluation_date=evaluation_date,
+            max_allowed_mae=max_allowed_mae,
+            execution_type=ValidationExecutionType.FORMAL_PRODUCTION_AUDIT
+        )
+
     def validate_out_of_sample(
         self,
         oos_features: Optional[Any] = None,
@@ -245,6 +279,9 @@ class LightGBMGrowthForecaster:
         (MAE <= 2.0 且超越基准模型)，方允许晋升为 VERIFIED_PRODUCTION 阶段。
         """
         if not self.is_algorithm_fitted or not self.is_data_verified or not self.models:
+            self.is_out_of_sample_validated = False
+            if self.model_stage == ModelStage.VERIFIED_PRODUCTION:
+                self.model_stage = ModelStage.BENCHMARK
             return {
                 "status": "VALIDATION_FAILED",
                 "model_stage": self.model_stage.value,
@@ -290,7 +327,7 @@ class LightGBMGrowthForecaster:
                 q_status = (
                     getattr(prov, "quality_status", None)
                     or (prov.get("quality_status") if isinstance(prov, dict) else None)
-                    or (DataQualityStatus.VERIFIED if not is_synthetic and not is_model_generated else DataQualityStatus.UNVERIFIED)
+                    or DataQualityStatus.UNVERIFIED
                 )
                 s = OOSValidationSample(
                     sample_id=str(sid),
@@ -300,7 +337,7 @@ class LightGBMGrowthForecaster:
                     feature_available_at=datetime.utcnow(),
                     label_period_end=evaluation_date or date.today(),
                     label_observed_at=datetime.utcnow(),
-                    label_source="Audit_Validated_Registry",
+                    label_source="Raw_Caller_Array",
                     label_quality_status=DataQualityStatus(q_status),
                     source_record_id=f"rec_{idx}",
                     data_quality_status=DataQualityStatus(q_status),
@@ -312,11 +349,12 @@ class LightGBMGrowthForecaster:
                 samples.append(s)
 
             dataset = OOSValidationDataset(
-                dataset_id="oos_dyn_dataset",
+                dataset_id="oos_dyn_raw",
                 dataset_version="v1.1-oos",
-                audit_status=DataQualityStatus.VERIFIED if not is_synthetic and not is_model_generated else DataQualityStatus.UNVERIFIED,
+                audit_status=DataQualityStatus.UNVERIFIED,
                 samples=samples,
-                is_synthetic=is_synthetic
+                is_synthetic=is_synthetic,
+                is_registered=False
             )
 
         from src.decision_engine.model_validator import ModelValidationService
@@ -336,19 +374,35 @@ class LightGBMGrowthForecaster:
         self.oos_validation = rec
 
         if audit_res.get("passed") is True:
-            self.is_out_of_sample_validated = True
-            self.model_stage = ModelStage.VERIFIED_PRODUCTION
-            return {
-                "status": "PROMOTED_TO_PRODUCTION",
-                "model_stage": self.model_stage.value,
-                "passed": True,
-                "max_mae": audit_res.get("max_mae"),
-                "threshold": audit_res.get("threshold"),
-                "details": audit_res.get("details"),
-                "message": f"样本外跨周期检验通过 (Max MAE: {audit_res.get('max_mae')} <= {audit_res.get('threshold')})，模型晋升为正式生产验证状态。"
-            }
+            if audit_res.get("status") == "PROMOTED_TO_PRODUCTION":
+                self.is_out_of_sample_validated = True
+                self.model_stage = ModelStage.VERIFIED_PRODUCTION
+                return {
+                    "status": "PROMOTED_TO_PRODUCTION",
+                    "model_stage": self.model_stage.value,
+                    "passed": True,
+                    "max_mae": audit_res.get("max_mae"),
+                    "threshold": audit_res.get("threshold"),
+                    "details": audit_res.get("details"),
+                    "message": f"样本外跨周期检验通过 (Max MAE: {audit_res.get('max_mae')} <= {audit_res.get('threshold')})，模型晋升为正式生产验证状态。"
+                }
+            else:
+                self.is_out_of_sample_validated = False
+                if self.model_stage == ModelStage.VERIFIED_PRODUCTION:
+                    self.model_stage = ModelStage.BENCHMARK
+                return {
+                    "status": audit_res.get("status", "PASSED_TEST_ONLY"),
+                    "model_stage": self.model_stage.value,
+                    "passed": True,
+                    "max_mae": audit_res.get("max_mae"),
+                    "threshold": audit_res.get("threshold"),
+                    "details": audit_res.get("details"),
+                    "message": "工程测试验证通过 (TEST_ONLY)，但未达正式生产准入要求，模型保持基准阶段。"
+                }
         else:
             self.is_out_of_sample_validated = False
+            if self.model_stage == ModelStage.VERIFIED_PRODUCTION:
+                self.model_stage = ModelStage.BENCHMARK
             return {
                 "status": audit_res.get("status", "OOS_VALIDATION_FAILED"),
                 "model_stage": self.model_stage.value,
@@ -369,6 +423,7 @@ class LightGBMGrowthForecaster:
         """实验性拟合接口：支持基于 MANUAL_REFERENCE 待逐项核验样本进行算法探索。
         
         严格约束：
+        - 各期限独立训练，禁止跨期限复制或替代标签。
         - 模型状态标记为 EXPERIMENTAL。
         - is_data_verified 严格为 False。
         - 后续所有预测输出 is_verified 严格为 False，绝不产生正式预测。
@@ -382,12 +437,17 @@ class LightGBMGrowthForecaster:
         fitted_horizons = []
         for horizon in [1, 3, 5]:
             if horizon not in labels_by_horizon:
+                if horizon in self.models:
+                    del self.models[horizon]
                 continue
 
             raw_y = labels_by_horizon[horizon]
             # 过滤未成熟 (None / NaN) 标签
             valid_mask = pd.notna(raw_y) & [y is not None for y in raw_y]
-            if np.sum(valid_mask) < 5:
+            valid_count = int(np.sum(valid_mask))
+            if valid_count < 5:
+                if horizon in self.models:
+                    del self.models[horizon]
                 continue
 
             valid_X = features_df[valid_mask].values if hasattr(features_df, "values") else np.array(features)[valid_mask]
@@ -411,7 +471,7 @@ class LightGBMGrowthForecaster:
             return {
                 "status": ModelTrainingStatus.INSUFFICIENT_DATA.value,
                 "model_stage": self.model_stage.value,
-                "message": "无有效成熟标签可供实验性拟合。"
+                "message": "所有预测期限成熟样本均不足 5 条，无法拟合实验模型。"
             }
 
         self.training_status = ModelTrainingStatus.EXPERIMENTAL
