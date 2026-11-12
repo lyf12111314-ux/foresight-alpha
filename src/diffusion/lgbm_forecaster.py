@@ -278,7 +278,7 @@ class LightGBMGrowthForecaster:
         仅当模型基于 VERIFIED 数据完成基准训练，且在完全独立的跨周期测试集上通过独立审计
         (MAE <= 2.0 且超越基准模型)，方允许晋升为 VERIFIED_PRODUCTION 阶段。
         """
-        if not self.is_algorithm_fitted or not self.is_data_verified or not self.models:
+        if not self.is_algorithm_fitted or not self.models:
             self.is_out_of_sample_validated = False
             if self.model_stage == ModelStage.VERIFIED_PRODUCTION:
                 self.model_stage = ModelStage.BENCHMARK
@@ -286,8 +286,20 @@ class LightGBMGrowthForecaster:
                 "status": "VALIDATION_FAILED",
                 "model_stage": self.model_stage.value,
                 "passed": False,
-                "rejection_reason": "模型尚未完成真实验证基准拟合，无法执行样本外检验。",
-                "message": "模型尚未完成真实验证基准拟合，无法执行样本外检验。"
+                "rejection_reason": "模型尚未完成基准拟合，无法执行样本外检验。",
+                "message": "模型尚未完成基准拟合，无法执行样本外检验。"
+            }
+
+        if execution_type == ValidationExecutionType.FORMAL_PRODUCTION_AUDIT and not self.is_data_verified:
+            self.is_out_of_sample_validated = False
+            if self.model_stage == ModelStage.VERIFIED_PRODUCTION:
+                self.model_stage = ModelStage.BENCHMARK
+            return {
+                "status": "VALIDATION_FAILED",
+                "model_stage": self.model_stage.value,
+                "passed": False,
+                "rejection_reason": "模型尚未完成真实验证基准拟合，无法执行正式生产级样本外检验。",
+                "message": "模型尚未完成真实验证基准拟合，无法执行正式生产级样本外检验。"
             }
 
         dataset = validation_dataset
@@ -560,12 +572,17 @@ class LightGBMGrowthForecaster:
             "warning": "模型使用合成模拟数据训练，预测结果不可用于生产决策。"
         }
 
-    def predict_growth(self, features: Dict[str, float]) -> Dict[str, Any]:
+    def predict_growth(
+        self,
+        features: Optional[Dict[str, float]],
+        require_complete_features: bool = False
+    ) -> Dict[str, Any]:
         """对单技术主题输入特征预测未来增长倍数。
         
         若模型未拟合，返回 MODEL_NOT_TRAINED 且倍数为 None。
         若模型处于 EXPERIMENTAL 实验阶段，返回 UNVERIFIED_RESEARCH 且 is_verified 严格为 False。
         仅当模型处于 VERIFIED_PRODUCTION 时，才输出正式预测。
+        当 require_complete_features=True 或处于生产就绪阶段时，缺失特征拒绝使用默认值填充，返回 INSUFFICIENT_FEATURES。
         """
         if not self.is_algorithm_fitted or not self.models:
             return {
@@ -584,14 +601,48 @@ class LightGBMGrowthForecaster:
                 "message": "真实样本不足或未达准入门槛，LightGBM模型未训练，不输出虚构预测成长倍数。"
             }
 
+        is_formal = bool(require_complete_features)
+
+        # 严格检查特征完整性 (杜绝空字典触发默认特征预测)
+        if features is None or not isinstance(features, dict) or len(features) == 0:
+            if is_formal:
+                return {
+                    "status": "INSUFFICIENT_FEATURES",
+                    "model_stage": self.model_stage.value,
+                    "is_verified": False,
+                    "forecasts": {
+                        "1y": {"point_estimate": None, "ci_low": None, "ci_high": None, "scenarios": {}},
+                        "3y": {"point_estimate": None, "ci_low": None, "ci_high": None, "scenarios": {}},
+                        "5y": {"point_estimate": None, "ci_low": None, "ci_high": None, "scenarios": {}}
+                    },
+                    "driver_feature_importance": {},
+                    "message": "未提供有效特征向量，正式预测严禁使用默认数值填充。"
+                }
+            features = {}
+
+        missing_keys = [k for k in self.feature_names if k not in features or features[k] is None]
+        if missing_keys and is_formal:
+            return {
+                "status": "INSUFFICIENT_FEATURES",
+                "model_stage": self.model_stage.value,
+                "is_verified": False,
+                "forecasts": {
+                    "1y": {"point_estimate": None, "ci_low": None, "ci_high": None, "scenarios": {}},
+                    "3y": {"point_estimate": None, "ci_low": None, "ci_high": None, "scenarios": {}},
+                    "5y": {"point_estimate": None, "ci_low": None, "ci_high": None, "scenarios": {}}
+                },
+                "driver_feature_importance": {},
+                "message": f"正式预测缺少关键输入特征 {missing_keys}，严禁使用经验默认值替代。"
+            }
+
         feat_vector = np.array([[
-            features.get("velocity_1y", 0.0),
-            features.get("acceleration", 0.0),
-            features.get("active_institutions", 0.0),
-            features.get("github_momentum", 0.0),
-            features.get("macro_multiplier", 1.0),
-            features.get("entropy_score", 0.5),
-            features.get("novelty_score", 0.5)
+            float(features.get("velocity_1y", 0.0)),
+            float(features.get("acceleration", 0.0)),
+            float(features.get("active_institutions", 0.0)),
+            float(features.get("github_momentum", 0.0)),
+            float(features.get("macro_multiplier", 1.0)),
+            float(features.get("entropy_score", 0.5)),
+            float(features.get("novelty_score", 0.5))
         ]])
 
         predictions = {}

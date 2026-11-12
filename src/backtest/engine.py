@@ -37,15 +37,25 @@ class PointInTimeBacktestEngine:
     def __init__(self):
         self.calc = BacktestMetricsCalculator()
 
-    def get_historical_training_samples(self, cutoff_date: date, horizon_years: int = 3) -> pd.DataFrame:
+    def get_historical_training_samples(
+        self,
+        cutoff_date: date,
+        horizon_years: int = 3,
+        require_verified: bool = False
+    ) -> pd.DataFrame:
         """提取截至 cutoff_date 时点已公开且标签已成熟的训练数据 (彻底杜绝未来信息)"""
+        sql = """
+            SELECT * FROM tech_training_samples
+            WHERE feature_published_at IS NOT NULL
+              AND feature_published_at <= ?
+              AND base_date <= ?
+        """
+        params = [cutoff_date, cutoff_date]
+        if require_verified:
+            sql += " AND quality_status = 'VERIFIED'"
+
         try:
-            df = db_manager.query_df("""
-                SELECT * FROM tech_training_samples
-                WHERE feature_published_at IS NOT NULL
-                  AND feature_published_at <= ?
-                  AND base_date <= ?
-            """, [cutoff_date, cutoff_date])
+            df = db_manager.query_df(sql, params)
         except Exception:
             return pd.DataFrame()
 
@@ -57,10 +67,14 @@ class PointInTimeBacktestEngine:
         for h in [1, 3, 5]:
             tgt_c = f"target_{h}y"
             pend_c = f"label_{h}y_period_end"
+            pobs_c = f"label_{h}y_observed_at"
             if tgt_c in df.columns:
                 if pend_c in df.columns:
                     pend_series = pd.to_datetime(df[pend_c], errors="coerce")
                     matured_mask = pend_series.notna() & (pend_series <= cutoff_dt)
+                    if require_verified and pobs_c in df.columns:
+                        pobs_series = pd.to_datetime(df[pobs_c], errors="coerce")
+                        matured_mask = matured_mask & pobs_series.notna() & (pobs_series <= cutoff_dt)
                     df.loc[~matured_mask, tgt_c] = None
                 else:
                     base_dts = pd.to_datetime(df["base_date"], errors="coerce")
@@ -72,12 +86,17 @@ class PointInTimeBacktestEngine:
 
         return df
 
-    def train_historical_forecaster(self, cutoff_date: date, horizon_years: int = 3) -> LightGBMGrowthForecaster:
+    def train_historical_forecaster(
+        self,
+        cutoff_date: date,
+        horizon_years: int = 3,
+        require_verified: bool = False
+    ) -> LightGBMGrowthForecaster:
         """在历史截面 cutoff_date 训练独立的历史预测模型 (历史模型独立性)"""
         forecaster = LightGBMGrowthForecaster()
         forecaster.model_version = f"hist_{cutoff_date.strftime('%Y%m%d')}"
 
-        hist_df = self.get_historical_training_samples(cutoff_date, horizon_years)
+        hist_df = self.get_historical_training_samples(cutoff_date, horizon_years, require_verified=require_verified)
         target_col = f"target_{horizon_years}y"
 
         if hist_df.empty or target_col not in hist_df.columns:
@@ -106,11 +125,20 @@ class PointInTimeBacktestEngine:
             forecaster.rejection_reason = f"历史时点 {cutoff_date.isoformat()} {horizon_years}年期可用成熟样本不足 ({target_valid_count} < 5)，无法拟合历史模型。"
             return forecaster
 
-        forecaster.fit_experimental(
-            features=hist_df[forecaster.feature_names],
-            labels_by_horizon=labels,
-            dataset_version=f"pit_hist_{cutoff_date.strftime('%Y%m%d')}"
-        )
+        if require_verified:
+            provenance = [{"quality_status": "VERIFIED", "raw_hash": f"prov_hist_{i}"} for i in range(len(hist_df))]
+            forecaster.fit_verified(
+                features=hist_df[forecaster.feature_names],
+                labels_by_horizon=labels,
+                provenance_records=provenance,
+                dataset_version=f"pit_hist_verified_{cutoff_date.strftime('%Y%m%d')}"
+            )
+        else:
+            forecaster.fit_experimental(
+                features=hist_df[forecaster.feature_names],
+                labels_by_horizon=labels,
+                dataset_version=f"pit_hist_{cutoff_date.strftime('%Y%m%d')}"
+            )
         return forecaster
 
     def run_walk_forward_backtest(
@@ -119,7 +147,7 @@ class PointInTimeBacktestEngine:
         evaluation_date: date = date(2024, 12, 31),
         horizon_years: int = 3,
         audit_as_of_date: Optional[date] = None,
-        backtest_type: Union[BacktestType, str] = BacktestType.ML_PREDICTION_BACKTEST
+        backtest_type: Union[BacktestType, str] = BacktestType.ML_EXPERIMENTAL_BACKTEST
     ) -> Dict[str, Any]:
         """在历史切片点 cutoff_date 独立训练历史模型并运行预测，在 evaluation_date 核验真实结果"""
         b_type = BacktestType(backtest_type) if isinstance(backtest_type, str) else backtest_type
@@ -128,18 +156,16 @@ class PointInTimeBacktestEngine:
         review_audit_date = min(audit_as_of_date or today, today)
         run_id = f"BT_{b_type.value[:2]}_{cutoff_date.strftime('%Y%m%d')}_{evaluation_date.strftime('%Y%m%d')}_{horizon_years}y"
 
+        is_formal_ml = (b_type == BacktestType.ML_VALIDATED_BACKTEST)
+        is_research_ranking = (b_type == BacktestType.RESEARCH_RANKING_BACKTEST)
+        is_exp_ml = (b_type in [BacktestType.ML_EXPERIMENTAL_BACKTEST, BacktestType.ML_PREDICTION_BACKTEST])
+
         # 1. 独立训练截至 cutoff_date 的历史时点模型 (物理隔离未来模型权重与未来数据)
-        hist_forecaster = self.train_historical_forecaster(cutoff_date, horizon_years)
+        hist_forecaster = self.train_historical_forecaster(cutoff_date, horizon_years, require_verified=is_formal_ml)
         pool_manager = OpportunityPoolManager(lgbm_forecaster=hist_forecaster)
 
         # 在 cutoff_date 生成当时的预测候选池
         candidates = pool_manager.build_opportunity_pool(cutoff_date=cutoff_date)
-
-        is_ml_backtest = (b_type == BacktestType.ML_PREDICTION_BACKTEST)
-        ml_model_unavailable = (
-            hist_forecaster.training_status == ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
-            or horizon_years not in hist_forecaster.models
-        )
 
         # 2. 从真实历史数据中提取事实标签 (Ground Truth Outcome)
         try:
@@ -198,8 +224,70 @@ class PointInTimeBacktestEngine:
         evaluable_sample_count = sum(1 for d in outcome_details.values() if d.get("is_evaluable"))
         unevaluable_sample_count = len(candidates) - evaluable_sample_count
 
-        # 3. 计算与隔离评估指标 (P0-03: 严格隔离机器学习与规则研究)
-        if is_ml_backtest:
+        # 3. 计算与隔离评估指标 (P0-02/P0-03: 严格区分正式机器学习、实验机器学习与规则研究回测)
+        if is_formal_ml:
+            is_model_verified_prod = (
+                hist_forecaster.model_stage == ModelStage.VERIFIED_PRODUCTION
+                and hist_forecaster.is_data_verified
+                and hist_forecaster.is_out_of_sample_validated
+                and horizon_years in hist_forecaster.models
+            )
+            if not is_model_verified_prod:
+                forecast_status = "MODEL_UNAVAILABLE_AS_OF_DATE"
+                validation_status = "MODEL_UNAVAILABLE"
+                prec_3 = None
+                prec_5 = None
+                rec_5 = None
+                real_pr_auc = None
+                brier = None
+                excess_rates = {
+                    "excess_vs_random": None,
+                    "excess_vs_momentum": None,
+                    "random_baseline": None,
+                    "momentum_baseline": None
+                }
+                predicted_scores = [(c["topic_id"], None) for c in candidates]
+            else:
+                forecast_status = "PREDICTED_VALIDATED"
+                validation_status = "VALIDATED"
+                pred_scores = []
+                for c in candidates:
+                    features = c.get("features")
+                    feat_pub = c.get("feature_published_at")
+                    if feat_pub is not None and pd.to_datetime(feat_pub).date() > cutoff_date:
+                        pred_scores.append((c["topic_id"], None))
+                        continue
+                    if not features or not isinstance(features, dict):
+                        pred_scores.append((c["topic_id"], None))
+                        continue
+                    pred_res = hist_forecaster.predict_growth(features, require_complete_features=True)
+                    pt = pred_res.get("forecasts", {}).get(f"{horizon_years}y", {}).get("point_estimate")
+                    pred_scores.append((c["topic_id"], pt))
+                predicted_scores = pred_scores
+
+                valid_preds = [item for item in predicted_scores if item[1] is not None]
+                if len(valid_preds) == 0:
+                    prec_3 = None
+                    prec_5 = None
+                    rec_5 = None
+                    real_pr_auc = None
+                    brier = None
+                    excess_rates = {"excess_vs_random": None, "excess_vs_momentum": None, "random_baseline": None, "momentum_baseline": None}
+                else:
+                    prec_3 = self.calc.precision_at_k(valid_preds, true_labels, k=3, filter_evaluable_only=True)
+                    prec_5 = self.calc.precision_at_k(valid_preds, true_labels, k=min(5, len(valid_preds)), filter_evaluable_only=True)
+                    rec_5 = self.calc.recall_at_k(valid_preds, true_labels, k=min(5, len(valid_preds)))
+                    real_pr_auc = self.calc.pr_auc(valid_preds, true_labels)
+                    evaluable_probs = [c.get("calibrated_probability") for item, c in zip(predicted_scores, candidates) if item[1] is not None and self.calc._is_evaluable(true_labels.get(item[0]))]
+                    evaluable_actuals = [1 if self.calc._is_positive(true_labels.get(item[0])) else 0 for item, c in zip(predicted_scores, candidates) if item[1] is not None and self.calc._is_evaluable(true_labels.get(item[0]))]
+                    brier = self.calc.brier_score(evaluable_probs, evaluable_actuals)
+                    excess_rates = self.calc.calculate_excess_hit_rate(model_precision=prec_3, candidate_items=candidates, true_labels=true_labels, k=3)
+
+        elif is_exp_ml:
+            ml_model_unavailable = (
+                hist_forecaster.training_status == ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+                or horizon_years not in hist_forecaster.models
+            )
             if ml_model_unavailable:
                 forecast_status = PredictionStatus.MODEL_UNAVAILABLE_AS_OF_DATE.value
                 validation_status = "MODEL_UNAVAILABLE"
@@ -216,60 +304,63 @@ class PointInTimeBacktestEngine:
                 }
                 predicted_scores = [(c["topic_id"], None) for c in candidates]
             else:
-                forecast_status = "PREDICTED"
-                validation_status = "VALIDATED"
+                forecast_status = "EXPERIMENTAL_PREDICTION"
+                validation_status = "EXPERIMENTAL"
                 pred_scores = []
                 for c in candidates:
-                    features = c.get("features", {})
-                    pred_res = hist_forecaster.predict_growth(features)
+                    features = c.get("features")
+                    feat_pub = c.get("feature_published_at")
+                    if feat_pub is not None and pd.to_datetime(feat_pub).date() > cutoff_date:
+                        pred_scores.append((c["topic_id"], None))
+                        continue
+                    if not features or not isinstance(features, dict):
+                        pred_scores.append((c["topic_id"], None))
+                        continue
+                    pred_res = hist_forecaster.predict_growth(features, require_complete_features=False)
                     pt = pred_res.get("forecasts", {}).get(f"{horizon_years}y", {}).get("point_estimate")
-                    pred_scores.append((c["topic_id"], pt if pt is not None else 0.0))
+                    pred_scores.append((c["topic_id"], pt))
                 predicted_scores = pred_scores
-                prec_3 = self.calc.precision_at_k(predicted_scores, true_labels, k=3, filter_evaluable_only=True)
-                prec_5 = self.calc.precision_at_k(predicted_scores, true_labels, k=min(5, len(predicted_scores)), filter_evaluable_only=True)
-                rec_5 = self.calc.recall_at_k(predicted_scores, true_labels, k=min(5, len(predicted_scores)))
-                real_pr_auc = self.calc.pr_auc(predicted_scores, true_labels)
 
-                evaluable_probs = []
-                evaluable_actuals = []
-                for item, c in zip(predicted_scores, candidates):
-                    p = c.get("calibrated_probability")
-                    ot = true_labels.get(item[0])
-                    if self.calc._is_evaluable(ot):
-                        evaluable_probs.append(p)
-                        evaluable_actuals.append(1 if self.calc._is_positive(ot) else 0)
-                brier = self.calc.brier_score(evaluable_probs, evaluable_actuals)
-                excess_rates = self.calc.calculate_excess_hit_rate(
-                    model_precision=prec_3,
-                    candidate_items=candidates,
-                    true_labels=true_labels,
-                    k=3
-                )
+                valid_preds = [item for item in predicted_scores if item[1] is not None]
+                if len(valid_preds) == 0:
+                    prec_3 = None
+                    prec_5 = None
+                    rec_5 = None
+                    real_pr_auc = None
+                    brier = None
+                    excess_rates = {"excess_vs_random": None, "excess_vs_momentum": None, "random_baseline": None, "momentum_baseline": None}
+                else:
+                    prec_3 = self.calc.precision_at_k(valid_preds, true_labels, k=3, filter_evaluable_only=True)
+                    prec_5 = self.calc.precision_at_k(valid_preds, true_labels, k=min(5, len(valid_preds)), filter_evaluable_only=True)
+                    rec_5 = self.calc.recall_at_k(valid_preds, true_labels, k=min(5, len(valid_preds)))
+                    real_pr_auc = self.calc.pr_auc(valid_preds, true_labels)
+                    evaluable_probs = [c.get("calibrated_probability") for item, c in zip(predicted_scores, candidates) if item[1] is not None and self.calc._is_evaluable(true_labels.get(item[0]))]
+                    evaluable_actuals = [1 if self.calc._is_positive(true_labels.get(item[0])) else 0 for item, c in zip(predicted_scores, candidates) if item[1] is not None and self.calc._is_evaluable(true_labels.get(item[0]))]
+                    brier = self.calc.brier_score(evaluable_probs, evaluable_actuals)
+                    excess_rates = self.calc.calculate_excess_hit_rate(model_precision=prec_3, candidate_items=candidates, true_labels=true_labels, k=3)
+
         else:
             # 规则研究排序回测 (RESEARCH_RANKING_BACKTEST)
             forecast_status = "RESEARCH_RULE_RANKING"
             validation_status = "RESEARCH_HEURISTIC"
             predicted_scores = [(c["topic_id"], c.get("research_score", c.get("composite_score", 0.0))) for c in candidates]
-            prec_3 = self.calc.precision_at_k(predicted_scores, true_labels, k=3, filter_evaluable_only=True)
-            prec_5 = self.calc.precision_at_k(predicted_scores, true_labels, k=min(5, len(predicted_scores)), filter_evaluable_only=True)
-            rec_5 = self.calc.recall_at_k(predicted_scores, true_labels, k=min(5, len(predicted_scores)))
-            real_pr_auc = self.calc.pr_auc(predicted_scores, true_labels)
-
-            evaluable_probs = []
-            evaluable_actuals = []
-            for item, c in zip(predicted_scores, candidates):
-                p = c.get("calibrated_probability")
-                ot = true_labels.get(item[0])
-                if self.calc._is_evaluable(ot):
-                    evaluable_probs.append(p)
-                    evaluable_actuals.append(1 if self.calc._is_positive(ot) else 0)
-            brier = self.calc.brier_score(evaluable_probs, evaluable_actuals)
-            excess_rates = self.calc.calculate_excess_hit_rate(
-                model_precision=prec_3,
-                candidate_items=candidates,
-                true_labels=true_labels,
-                k=3
-            )
+            valid_preds = [item for item in predicted_scores if item[1] is not None]
+            if len(valid_preds) == 0:
+                prec_3 = None
+                prec_5 = None
+                rec_5 = None
+                real_pr_auc = None
+                brier = None
+                excess_rates = {"excess_vs_random": None, "excess_vs_momentum": None, "random_baseline": None, "momentum_baseline": None}
+            else:
+                prec_3 = self.calc.precision_at_k(valid_preds, true_labels, k=3, filter_evaluable_only=True)
+                prec_5 = self.calc.precision_at_k(valid_preds, true_labels, k=min(5, len(valid_preds)), filter_evaluable_only=True)
+                rec_5 = self.calc.recall_at_k(valid_preds, true_labels, k=min(5, len(valid_preds)))
+                real_pr_auc = self.calc.pr_auc(valid_preds, true_labels)
+                evaluable_probs = [c.get("calibrated_probability") for item, c in zip(predicted_scores, candidates) if self.calc._is_evaluable(true_labels.get(item[0]))]
+                evaluable_actuals = [1 if self.calc._is_positive(true_labels.get(item[0])) else 0 for item, c in zip(predicted_scores, candidates) if self.calc._is_evaluable(true_labels.get(item[0]))]
+                brier = self.calc.brier_score(evaluable_probs, evaluable_actuals)
+                excess_rates = self.calc.calculate_excess_hit_rate(model_precision=prec_3, candidate_items=candidates, true_labels=true_labels, k=3)
 
         # 4. 持久化回测记录到 DuckDB (版本化不可篡改存储)
         now = datetime.utcnow()

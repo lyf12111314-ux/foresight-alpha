@@ -272,7 +272,8 @@ def test_p0_02_model_promotion_requires_oos_validation():
         dataset_id="REG_OOS_TECH_REMEDIATION_P0",
         dataset_version="v1.1-oos-audited",
         audit_status=DataQualityStatus.VERIFIED,
-        checksum_sha256="fedcba9876543210" * 4,
+        is_audited_production_ready=True,
+        has_independent_audit_certificate=True,
         samples=oos_samples
     ))
     res_oos_pass = forecaster.validate_formal_production_oos(

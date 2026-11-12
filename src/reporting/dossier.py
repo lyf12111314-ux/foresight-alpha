@@ -23,8 +23,9 @@ class ResearchDossierGenerator:
         score = candidate_info.get("research_score", candidate_info.get("composite_score", 75.0))
         data_cov = candidate_info.get("data_coverage_score", 60.0)
         calibrated_prob = candidate_info.get("calibrated_probability")
-        pred_status = candidate_info.get("prediction_status", "UNVERIFIED_RESEARCH")
+        raw_pred_status = candidate_info.get("prediction_status", "UNVERIFIED_RESEARCH")
         is_verified = candidate_info.get("is_verified_forecast", False)
+        pred_status = raw_pred_status if is_verified else f"{raw_pred_status} (实验研究模式 - 未获生产验证)"
         rating = candidate_info.get("rating", "WATCHLIST_A")
         growth_3y = candidate_info.get("growth_3y_multiple")
         prob_10x = candidate_info.get("prob_10x_super_return_pct")

@@ -215,7 +215,8 @@ class CompanySurvivalEngine:
         provenance_records: Optional[List[Any]] = None,
         min_c_index: Optional[float] = None,
         evaluation_date: Optional[date] = None,
-        execution_type: ValidationExecutionType = ValidationExecutionType.FORMAL_PRODUCTION_AUDIT
+        execution_type: ValidationExecutionType = ValidationExecutionType.FORMAL_PRODUCTION_AUDIT,
+        registered_dataset_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """样本外跨周期生存分析验证门禁 (OOS Concordance Index Validation - 审计级实施).
         
@@ -240,7 +241,8 @@ class CompanySurvivalEngine:
             provenance_records=provenance_records,
             min_c_index=min_c_index,
             evaluation_date=evaluation_date,
-            execution_type=execution_type
+            execution_type=execution_type,
+            registered_dataset_id=registered_dataset_id
         )
 
         rec = audit_res.get("validation_record")

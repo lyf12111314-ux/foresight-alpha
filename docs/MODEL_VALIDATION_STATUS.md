@@ -41,17 +41,25 @@
   科研探索性推演，不作商业与投资决策参考。
 
 ### 3. 生产准入硬性门槛与可信注册中心
-- **可信验证数据集注册中心 (`TrustedValidationRegistry`)**：
-  正式生产验证准入只接受经独立审计登记的数据集引用 (`registered_dataset_id`)。禁止调用方传入普通数组、未注册数据或通过模型预测值自生标签 (`is_model_generated=True` 或 $\text{corr}>0.999$) 伪造验证；手工构造的 `VERIFIED` 状态或哈希不可替代注册凭据。
-- **分期限独立拟合与预测 (`P0-02`)**：
-  LightGBM 各预测期限 (1y/3y/5y) 独立筛选真实成熟标签与统计样本量。严禁跨预测期限复制或相互代偿标签。未达训练样本量的期限保持 `UNAVAILABLE`，预测结果严格返回 `None`。
-- **回测类型严格隔离 (`P0-03`)**：
-  历史回测分为 `ML_PREDICTION_BACKTEST` 与 `RESEARCH_RANKING_BACKTEST`。当历史模型缺失时，机器学习回测指标必须全为 `None`，严禁借用研究规则评分冒充机器学习准确率。
-- **Point-in-Time 真实时钟门禁 (`P0-04`)**：
-  历史模型训练严格排除 `feature_published_at IS NULL` 记录；`query_point_in_time` 在 `require_verified_timestamp=True` 时强制过滤非 `VERIFIED` 记录。
+- **服务端可信验证数据集注册中心 (`TrustedValidationRegistry`)**：
+  正式生产验证准入只接受经独立审计登记的数据集引用 (`registered_dataset_id`)。
+  - **规范化 SHA-256 摘要校验**：服务端根据样本集特征、标签、时序与来源严格重新计算规范哈希 (`compute_samples_checksum`)，任何手工伪造的 64 位哈希均会被立即识别拦截 (`REJECTED_CHECKSUM_TAMPERED`)。
+  - **样本替换防御**：调用方试图复用已注册 ID 传入篡改后的样本时，直接触发 `REJECTED_SAMPLE_SUBSTITUTION` 拦截。
+  - **权威证书门禁**：注册数据集必须具备权威第三方审计凭证 (`has_independent_audit_certificate=True`)。系统预置示例数据集 (`REG_OOS_TECH_V1_2023`, `REG_OOS_COHORT_V1_2023`) 严格标记为未获生产审计证书，正式生产验证入口保持阻断 (`REJECTED_DATASET_NOT_AUDITED_FOR_PRODUCTION`)。
+  - **防作弊反向审计**：严格校验验证标签与模型自身预测值的贴合度 (`atol <= 0.25` 或相关系数 $r > 0.999$)，检测到模型自生标签作弊时直接拒绝晋升 (`REJECTED_SELF_GENERATED_CHEAT`)。
+- **三轨独立历史回测体系 (`P0-02`)**：
+  历史回测分为三类，物理隔离存储于 `backtest_experiments` 表，彻底消除混淆：
+  1. `ML_VALIDATED_BACKTEST`：仅允许调用基于 VERIFIED 数据训练且通过独立 OOS 生产审计的模型。若历史模型未达标，机器学习指标严格为 `None`，不伪造准确率。
+  2. `ML_EXPERIMENTAL_BACKTEST`：调用历史实验模型，回测状态显式标记为 `EXPERIMENTAL`，预测状态为 `EXPERIMENTAL_PREDICTION`，绝不标记为 `VALIDATED`。
+  3. `RESEARCH_RANKING_BACKTEST`：纯规则型客观研究排序回测，与机器学习模型预测彻底物理隔离。
+- **端到端动态特征生成流水线 (`P0-03`)**：
+  从数据库历史时序查询真实动态特征（动态计算 `entropy_score`, `novelty_score`，严禁硬编码默认值 0.60/0.70）。
+  每个候选标的均携带完整特征向量字典存储于 `c["features"]`。正式历史预测遇到特征缺失时严格返回 `status="INSUFFICIENT_FEATURES"`，特征公开时间晚于历史时点时严格拒绝前视偏差。
+- **Point-in-Time 真实时钟严格模式 (`P0-04 / P1-02`)**：
+  历史模型训练严格排除 `feature_published_at IS NULL` 记录；`query_point_in_time` 在 `require_verified_timestamp=True` 时执行严格时序审计，若底层表元数据校验失败，直接抛出 `RuntimeError`，绝不静默放宽过滤条件。
 - **LightGBM 成长预测器**：
   生产准入硬性上限 $\text{MAE} \le 2.0$ 且必须显著超越全预测训练集均值/中位数基准 (Naive Baseline)。调用方传入宽松阈值会被系统自动截断回硬性上限。
 - **Cox 企业生存风险模型**：
   生产准入硬性下限 $C\text{-index} \ge 0.60$ 且必须超越随机基准 (0.50)。正式预测 (`is_formal=True`) 必须全部具备 4 项核心协变量 (`cash_burn_months`, `debt_ratio`, `gross_margin`, `competitor_count`)，严禁默认值填充。
 - **双轨排序治理机制**：
-  在当前阶段，全系统正式预测排名严格返回空 (`NO_VERIFIED_FORECASTS`)，真实反映系统能力边界。
+  在当前阶段，全系统正式预测排名严格返回空 (`NO_VERIFIED_FORECASTS`)，真实反映系统能力边界。所有实验预测与研究报告均显著标注 `UNVERIFIED_RESEARCH (实验研究模式 - 未获生产验证)`。

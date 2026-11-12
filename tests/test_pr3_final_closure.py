@@ -148,7 +148,8 @@ def test_model_predicted_labels_without_is_model_generated_flag_rejected():
         dataset_id="REG_CHEAT_TEST_01",
         dataset_version="v1.1-cheat",
         audit_status=DataQualityStatus.VERIFIED,
-        checksum_sha256="c" * 64,
+        is_audited_production_ready=True,
+        has_independent_audit_certificate=True,
         samples=cheat_samples
     ))
 

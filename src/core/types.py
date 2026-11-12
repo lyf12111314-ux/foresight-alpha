@@ -57,9 +57,11 @@ class SimulationType(str, Enum):
 
 
 class BacktestType(str, Enum):
-    """历史回测类型 (严格隔离机器学习预测回测与规则研究排序回测)"""
-    ML_PREDICTION_BACKTEST = "ML_PREDICTION_BACKTEST"               # 机器学习模型预测回测
+    """历史回测类型 (明确隔离正式机器学习、实验机器学习与规则研究回测)"""
+    ML_VALIDATED_BACKTEST = "ML_VALIDATED_BACKTEST"                 # 正式机器学习回测 (需全部真实验证证据)
+    ML_EXPERIMENTAL_BACKTEST = "ML_EXPERIMENTAL_BACKTEST"           # 实验机器学习回测 (基于实验模型)
     RESEARCH_RANKING_BACKTEST = "RESEARCH_RANKING_BACKTEST"         # 规则研究排序回测
+    ML_PREDICTION_BACKTEST = "ML_PREDICTION_BACKTEST"               # 兼容性旧标识 (自动按模型阶段路由为 VALIDATED 或 EXPERIMENTAL)
 
 
 class ModelStage(str, Enum):
@@ -125,7 +127,7 @@ class OOSValidationDataset(BaseModel):
     samples: List[OOSValidationSample] = Field(default_factory=list)
     source_archive: str = "Independent_OOS_Audit_Vault"
     is_synthetic: bool = False
-    is_registered: bool = False
+    is_registered: bool = False  # 仅作为客户端展示字段，系统服务端禁止以此作为认证凭据
     checksum_sha256: Optional[str] = None
 
 
@@ -133,13 +135,16 @@ class TrustedDatasetRegistration(BaseModel):
     """可信注册验证数据集定义 (P0-01 准入审计规范)"""
     dataset_id: str
     dataset_version: str
-    audit_status: DataQualityStatus = DataQualityStatus.VERIFIED
+    audit_status: DataQualityStatus = DataQualityStatus.UNVERIFIED
     registered_at: datetime = Field(default_factory=datetime.utcnow)
-    description: str = "经独立审计的真实历史样本外验证数据集"
+    description: str = "样本外验证数据集注册条目"
     samples: List[OOSValidationSample] = Field(default_factory=list)
+    sample_count: int = 0
     checksum_sha256: str = ""
     audit_authority: str = "Independent_OOS_Audit_Authority"
     is_synthetic: bool = False
+    is_audited_production_ready: bool = False       # 是否经独立审计具备正式生产准入资格
+    has_independent_audit_certificate: bool = False # 是否具备第三方权威审计凭证
 
 
 class OOSValidationRecord(BaseModel):

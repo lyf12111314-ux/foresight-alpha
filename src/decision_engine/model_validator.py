@@ -11,6 +11,8 @@
 
 from datetime import date, datetime
 from typing import Dict, Any, List, Optional, Set, Tuple, Union
+import json
+import hashlib
 import numpy as np
 import pandas as pd
 
@@ -25,13 +27,51 @@ from src.core.types import (
 )
 
 
+def compute_samples_checksum(samples: List[OOSValidationSample]) -> str:
+    """根据实际样本内容计算不可篡改的规范化 SHA-256 摘要 (防伪造、防替换样本)"""
+    if not samples:
+        return hashlib.sha256(b"EMPTY_DATASET").hexdigest()
+
+    canonical_records = []
+    for s in sorted(samples, key=lambda x: str(x.sample_id)):
+        feat_items = sorted([(str(k), float(v)) for k, v in s.features.items()]) if s.features else []
+        label_items = sorted([(int(k), float(v) if v is not None else None) for k, v in s.labels.items()]) if s.labels else []
+        rec = {
+            "sample_id": str(s.sample_id),
+            "dataset_version": str(s.dataset_version),
+            "decision_date": str(s.decision_date),
+            "features": feat_items,
+            "labels": label_items,
+            "label_period_end": str(s.label_period_end),
+            "is_synthetic": bool(s.is_synthetic),
+            "is_model_generated": bool(s.is_model_generated)
+        }
+        canonical_records.append(rec)
+    canonical_json = json.dumps(canonical_records, sort_keys=True)
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
 class TrustedValidationRegistry:
-    """可信样本外验证数据集注册中心 (P0-01 准入审计规范)"""
+    """可信样本外验证数据集注册中心 (P0-01 准入审计规范 - 权威注册与内容绑定)"""
     _registry: Dict[str, TrustedDatasetRegistration] = {}
 
     @classmethod
     def register(cls, registration: TrustedDatasetRegistration) -> None:
-        """登记经独立审计的真实历史验证数据集"""
+        """登记验证数据集，并记录样本内容摘要与防伪凭据"""
+        actual_hash = compute_samples_checksum(registration.samples)
+        
+        # 若未填摘要，自动填充为根据实际样本计算的规范摘要
+        if not registration.checksum_sha256 or not registration.checksum_sha256.strip():
+            registration.checksum_sha256 = actual_hash
+        
+        registration.sample_count = len(registration.samples)
+
+        # 数据集注册不能仅由业务调用方直接自设 audit_status=VERIFIED 而取得生产准入资格
+        # 必须具备第三方权威机构审计凭证 (has_independent_audit_certificate)
+        if registration.audit_status == DataQualityStatus.VERIFIED and not registration.has_independent_audit_certificate:
+            registration.is_audited_production_ready = False
+            registration.audit_status = DataQualityStatus.UNVERIFIED
+
         cls._registry[registration.dataset_id] = registration
 
     @classmethod
@@ -58,24 +98,36 @@ class TrustedValidationRegistry:
 
     @classmethod
     def _seed_default_registries(cls) -> None:
-        """初始化预设经独立审计的真实历史验证数据集注册记录"""
+        """初始化预设示例数据集。
+        
+        【重要审计约束】：
+        预置示例数据集严禁默认标记为经过真实独立生产审计！
+        只能标记为 UNVERIFIED 或 TEST_ONLY，is_audited_production_ready 严格为 False。
+        目前尚未建立真实生产审计数据来源时，正式生产验证入口保持关闭。
+        """
         cls._registry["REG_OOS_TECH_V1_2023"] = TrustedDatasetRegistration(
             dataset_id="REG_OOS_TECH_V1_2023",
-            dataset_version="v1.1-oos-2023",
-            audit_status=DataQualityStatus.VERIFIED,
-            description="2023年跨周期独立真实技术发展样本外验证集",
-            checksum_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            audit_authority="Independent_Quant_Auditor_Board",
-            is_synthetic=False
+            dataset_version="v1.1-oos-2023-example",
+            audit_status=DataQualityStatus.UNVERIFIED,
+            description="系统内置示例技术发展样本外验证集（仅供测试与研究参考，未获真实生产审计）",
+            checksum_sha256=compute_samples_checksum([]),
+            sample_count=0,
+            audit_authority="Internal_Research_Prototype",
+            is_synthetic=False,
+            is_audited_production_ready=False,
+            has_independent_audit_certificate=False
         )
         cls._registry["REG_OOS_COHORT_V1_2023"] = TrustedDatasetRegistration(
             dataset_id="REG_OOS_COHORT_V1_2023",
-            dataset_version="v1.1-oos-cohort-2023",
-            audit_status=DataQualityStatus.VERIFIED,
-            description="2023年跨周期独立真实企业生存事件样本外验证集",
-            checksum_sha256="8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
-            audit_authority="Independent_Risk_Auditor_Board",
-            is_synthetic=False
+            dataset_version="v1.1-oos-cohort-2023-example",
+            audit_status=DataQualityStatus.UNVERIFIED,
+            description="系统内置示例企业生存事件样本外验证集（仅供测试与研究参考，未获真实生产审计）",
+            checksum_sha256=compute_samples_checksum([]),
+            sample_count=0,
+            audit_authority="Internal_Research_Prototype",
+            is_synthetic=False,
+            is_audited_production_ready=False,
+            has_independent_audit_certificate=False
         )
 
 
@@ -150,6 +202,78 @@ class ModelValidationService:
         samples, dataset_meta = self._parse_validation_samples(validation_dataset, registered_dataset_id=target_reg_id)
 
         if not samples:
+            if execution_type == ValidationExecutionType.FORMAL_PRODUCTION_AUDIT:
+                # 检查是否注册
+                if not dataset_meta.get("is_registered", False):
+                    rejection = (
+                        "正式生产验证准入门禁拒绝：验证数据集未在可信注册中心 (TrustedValidationRegistry) 登记。"
+                        "调用方自报 is_registered 字段、自设 VERIFIED 或构造假哈希均无法通过真实性认证。"
+                    )
+                    rec = OOSValidationRecord(
+                        metric_name="Max_MAE",
+                        metric_value=999.0,
+                        threshold=effective_threshold,
+                        passed=False,
+                        evaluation_date=eval_date,
+                        test_sample_count=0,
+                        validation_type=ValidationExecutionType.FORMAL_PRODUCTION_AUDIT,
+                        validation_conclusion="REJECTED_UNREGISTERED_DATASET",
+                        rejection_reason=rejection
+                    )
+                    return {
+                        "status": "VALIDATION_REJECTED",
+                        "passed": False,
+                        "threshold": effective_threshold,
+                        "rejection_reason": rejection,
+                        "validation_record": rec,
+                        "model_stage": forecaster.model_stage.value if hasattr(forecaster, "model_stage") else ModelStage.UNTRAINED.value
+                    }
+                # 检查是否获得独立生产审计证书
+                if not dataset_meta.get("is_audited_production_ready", False) or dataset_meta.get("audit_status") not in [DataQualityStatus.VERIFIED, "VERIFIED"]:
+                    rejection = (
+                        "正式生产验证准入门禁拒绝：当前数据集为内置参考/示例数据集或未获得独立生产审计证书 (has_independent_audit_certificate=False)。"
+                        "目前尚未建立权威真实生产审计数据来源时，正式生产验证入口保持关闭。"
+                    )
+                    rec = OOSValidationRecord(
+                        metric_name="Max_MAE",
+                        metric_value=999.0,
+                        threshold=effective_threshold,
+                        passed=False,
+                        evaluation_date=eval_date,
+                        test_sample_count=0,
+                        validation_type=ValidationExecutionType.FORMAL_PRODUCTION_AUDIT,
+                        validation_conclusion="REJECTED_DATASET_NOT_AUDITED_FOR_PRODUCTION",
+                        rejection_reason=rejection
+                    )
+                    return {
+                        "status": "VALIDATION_REJECTED",
+                        "passed": False,
+                        "threshold": effective_threshold,
+                        "rejection_reason": rejection,
+                        "validation_record": rec,
+                        "model_stage": forecaster.model_stage.value if hasattr(forecaster, "model_stage") else ModelStage.UNTRAINED.value
+                    }
+                rec = OOSValidationRecord(
+                    metric_name="Max_MAE",
+                    metric_value=999.0,
+                    threshold=effective_threshold,
+                    passed=False,
+                    evaluation_date=eval_date,
+                    test_sample_count=0,
+                    validation_type=ValidationExecutionType.FORMAL_PRODUCTION_AUDIT,
+                    validation_conclusion="REJECTED_EMPTY_SAMPLES",
+                    rejection_reason="未提供有效的样本外验证数据集或样本集为空。"
+                )
+                return {
+                    "status": "VALIDATION_FAILED",
+                    "passed": False,
+                    "threshold": effective_threshold,
+                    "rejection_reason": "未提供有效的样本外验证数据集或样本集为空。",
+                    "validation_record": rec,
+                    "execution_type": execution_type.value,
+                    "model_stage": forecaster.model_stage.value if hasattr(forecaster, "model_stage") else ModelStage.UNTRAINED.value
+                }
+
             if hasattr(forecaster, "model_stage") and forecaster.model_stage == ModelStage.VERIFIED_PRODUCTION:
                 forecaster.model_stage = ModelStage.BENCHMARK
             if hasattr(forecaster, "is_out_of_sample_validated"):
@@ -163,51 +287,7 @@ class ModelValidationService:
                 "model_stage": forecaster.model_stage.value if hasattr(forecaster, "model_stage") else ModelStage.UNTRAINED.value
             }
 
-        # 检查是否包含合成或模型自生标签
-        has_synthetic = any(s.is_synthetic for s in samples) or dataset_meta.get("is_synthetic", False)
-        has_model_generated = any(s.is_model_generated for s in samples)
-        has_unverified_quality = any(
-            s.data_quality_status not in [DataQualityStatus.VERIFIED, DataQualityStatus.VERIFIED.value]
-            or s.label_quality_status not in [DataQualityStatus.VERIFIED, DataQualityStatus.VERIFIED.value]
-            for s in samples
-        ) or (dataset_meta.get("audit_status") not in [DataQualityStatus.VERIFIED, DataQualityStatus.VERIFIED.value, "VERIFIED"])
-
-        # 若包含合成、自生或未核验数据，强制降级为 TEST_ONLY / 无法晋升
-        effective_execution_type = execution_type
-        if has_synthetic or has_model_generated or has_unverified_quality:
-            if execution_type == ValidationExecutionType.FORMAL_PRODUCTION_AUDIT:
-                # 正式生产准入要求真实核验数据，含有伪造/合成/自生样本直接拒绝生产晋升
-                rejection = (
-                    "正式生产验证准入门禁拒绝：验证集包含模型自生标签 (is_model_generated=True)、"
-                    "合成模拟数据 (is_synthetic=True) 或未在可信注册中心登记的普通数组/未逐项核验数据 (quality_status != VERIFIED)。"
-                )
-                if hasattr(forecaster, "model_stage") and forecaster.model_stage == ModelStage.VERIFIED_PRODUCTION:
-                    forecaster.model_stage = ModelStage.BENCHMARK
-                if hasattr(forecaster, "is_out_of_sample_validated"):
-                    forecaster.is_out_of_sample_validated = False
-                rec = OOSValidationRecord(
-                    metric_name="Max_MAE",
-                    metric_value=999.0,
-                    threshold=effective_threshold,
-                    passed=False,
-                    evaluation_date=eval_date,
-                    test_sample_count=len(samples),
-                    validation_type=ValidationExecutionType.FORMAL_PRODUCTION_AUDIT,
-                    validation_conclusion="REJECTED_SYNTHETIC_OR_SELF_GENERATED",
-                    rejection_reason=rejection
-                )
-                return {
-                    "status": "VALIDATION_REJECTED",
-                    "passed": False,
-                    "threshold": effective_threshold,
-                    "rejection_reason": rejection,
-                    "validation_record": rec,
-                    "model_stage": forecaster.model_stage.value
-                }
-            else:
-                effective_execution_type = ValidationExecutionType.TEST_ONLY
-
-        # 第 2 步：时序与样本隔离检查 (Temporal & Window Isolation)
+        # 第 1 步：时序与样本隔离检查 (Temporal & Window Isolation)
         if training_sample_ids:
             overlap_ids = {s.sample_id for s in samples}.intersection(training_sample_ids)
             if overlap_ids:
@@ -286,12 +366,13 @@ class ModelValidationService:
                     "model_stage": forecaster.model_stage.value
                 }
 
-        # 检查可信注册中心审计注册 (P0-01 注册门禁)：普通数组或未注册数据严禁取得正式生产认证
-        if effective_execution_type == ValidationExecutionType.FORMAL_PRODUCTION_AUDIT:
+        # 第 2 步：检查可信注册中心审计注册与防作弊门禁 (P0-01 准入审计规范)
+        if execution_type == ValidationExecutionType.FORMAL_PRODUCTION_AUDIT:
+            # 1. 验证数据集必须在服务端可信注册中心登记，调用方自报 is_registered 字段无效
             if not dataset_meta.get("is_registered", False):
                 rejection = (
-                    "正式生产验证准入门禁拒绝：验证集未在可信注册中心 (TrustedValidationRegistry) 登记，"
-                    "普通数组或未注册数据无法取得正式生产验证资格 (手工构造 VERIFIED 状态或哈希不可冒充注册凭证)。"
+                    "正式生产验证准入门禁拒绝：验证数据集未在可信注册中心 (TrustedValidationRegistry) 登记。"
+                    "调用方自报 is_registered 字段、自设 VERIFIED 或构造假哈希均无法通过真实性认证。"
                 )
                 if hasattr(forecaster, "model_stage") and forecaster.model_stage == ModelStage.VERIFIED_PRODUCTION:
                     forecaster.model_stage = ModelStage.BENCHMARK
@@ -314,8 +395,142 @@ class ModelValidationService:
                     "threshold": effective_threshold,
                     "rejection_reason": rejection,
                     "validation_record": rec,
+                    "model_stage": forecaster.model_stage.value if hasattr(forecaster, "model_stage") else ModelStage.UNTRAINED.value
+                }
+
+            # 2. 检查调用方是否替换了样本内容 (Sample Substitution Check)
+            if dataset_meta.get("sample_substituted", False):
+                rejection = (
+                    "正式生产验证准入门禁拒绝：检测到验证样本与已注册数据集摘要不一致，"
+                    "调用方存在样本替换行为 (Sample Substitution Detected)，拒绝认证。"
+                )
+                if hasattr(forecaster, "model_stage") and forecaster.model_stage == ModelStage.VERIFIED_PRODUCTION:
+                    forecaster.model_stage = ModelStage.BENCHMARK
+                if hasattr(forecaster, "is_out_of_sample_validated"):
+                    forecaster.is_out_of_sample_validated = False
+                rec = OOSValidationRecord(
+                    metric_name="Max_MAE",
+                    metric_value=999.0,
+                    threshold=effective_threshold,
+                    passed=False,
+                    evaluation_date=eval_date,
+                    test_sample_count=len(samples),
+                    validation_type=ValidationExecutionType.FORMAL_PRODUCTION_AUDIT,
+                    validation_conclusion="REJECTED_SAMPLE_SUBSTITUTION",
+                    rejection_reason=rejection
+                )
+                return {
+                    "status": "VALIDATION_REJECTED",
+                    "passed": False,
+                    "threshold": effective_threshold,
+                    "rejection_reason": rejection,
+                    "validation_record": rec,
+                    "model_stage": forecaster.model_stage.value if hasattr(forecaster, "model_stage") else ModelStage.UNTRAINED.value
+                }
+
+            # 3. 检查注册数据集摘要篡改 (Tamper Check)
+            if dataset_meta.get("tampered", False):
+                rejection = (
+                    "正式生产验证准入门禁拒绝：已注册数据集内容发生变化但摘要未更新，"
+                    "数据真实性核准失效，拒绝认证。"
+                )
+                if hasattr(forecaster, "model_stage") and forecaster.model_stage == ModelStage.VERIFIED_PRODUCTION:
+                    forecaster.model_stage = ModelStage.BENCHMARK
+                if hasattr(forecaster, "is_out_of_sample_validated"):
+                    forecaster.is_out_of_sample_validated = False
+                rec = OOSValidationRecord(
+                    metric_name="Max_MAE",
+                    metric_value=999.0,
+                    threshold=effective_threshold,
+                    passed=False,
+                    evaluation_date=eval_date,
+                    test_sample_count=len(samples),
+                    validation_type=ValidationExecutionType.FORMAL_PRODUCTION_AUDIT,
+                    validation_conclusion="REJECTED_CHECKSUM_TAMPERED",
+                    rejection_reason=rejection
+                )
+                return {
+                    "status": "VALIDATION_REJECTED",
+                    "passed": False,
+                    "threshold": effective_threshold,
+                    "rejection_reason": rejection,
+                    "validation_record": rec,
+                    "model_stage": forecaster.model_stage.value if hasattr(forecaster, "model_stage") else ModelStage.UNTRAINED.value
+                }
+
+            # 4. 检查是否具备正式独立生产审计资质 (示例数据集或未审计数据集一律阻断)
+            if not dataset_meta.get("is_audited_production_ready", False) or dataset_meta.get("audit_status") not in [DataQualityStatus.VERIFIED, "VERIFIED"]:
+                rejection = (
+                    "正式生产验证准入门禁拒绝：当前数据集为内置参考/示例数据集或未获得独立生产审计证书 (has_independent_audit_certificate=False)。"
+                    "目前尚未建立权威真实生产审计数据来源时，正式生产验证入口保持关闭。"
+                )
+                if hasattr(forecaster, "model_stage") and forecaster.model_stage == ModelStage.VERIFIED_PRODUCTION:
+                    forecaster.model_stage = ModelStage.BENCHMARK
+                if hasattr(forecaster, "is_out_of_sample_validated"):
+                    forecaster.is_out_of_sample_validated = False
+                rec = OOSValidationRecord(
+                    metric_name="Max_MAE",
+                    metric_value=999.0,
+                    threshold=effective_threshold,
+                    passed=False,
+                    evaluation_date=eval_date,
+                    test_sample_count=len(samples),
+                    validation_type=ValidationExecutionType.FORMAL_PRODUCTION_AUDIT,
+                    validation_conclusion="REJECTED_DATASET_NOT_AUDITED_FOR_PRODUCTION",
+                    rejection_reason=rejection
+                )
+                return {
+                    "status": "VALIDATION_REJECTED",
+                    "passed": False,
+                    "threshold": effective_threshold,
+                    "rejection_reason": rejection,
+                    "validation_record": rec,
+                    "model_stage": forecaster.model_stage.value if hasattr(forecaster, "model_stage") else ModelStage.UNTRAINED.value
+                }
+
+        # 检查是否包含合成或模型自生标签
+        has_synthetic = any(s.is_synthetic for s in samples) or dataset_meta.get("is_synthetic", False)
+        has_model_generated = any(s.is_model_generated for s in samples)
+        has_unverified_quality = any(
+            s.data_quality_status not in [DataQualityStatus.VERIFIED, DataQualityStatus.VERIFIED.value]
+            or s.label_quality_status not in [DataQualityStatus.VERIFIED, DataQualityStatus.VERIFIED.value]
+            for s in samples
+        ) or (dataset_meta.get("audit_status") not in [DataQualityStatus.VERIFIED, DataQualityStatus.VERIFIED.value, "VERIFIED"])
+
+        # 若包含合成、自生或未核验数据，强制降级为 TEST_ONLY / 无法晋升
+        effective_execution_type = execution_type
+        if has_synthetic or has_model_generated or has_unverified_quality:
+            if execution_type == ValidationExecutionType.FORMAL_PRODUCTION_AUDIT:
+                # 正式生产准入要求真实核验数据，含有伪造/合成/自生样本直接拒绝生产晋升
+                rejection = (
+                    "正式生产验证准入门禁拒绝：验证集包含模型自生标签 (is_model_generated=True)、"
+                    "合成模拟数据 (is_synthetic=True) 或未在可信注册中心登记的普通数组/未逐项核验数据 (quality_status != VERIFIED)。"
+                )
+                if hasattr(forecaster, "model_stage") and forecaster.model_stage == ModelStage.VERIFIED_PRODUCTION:
+                    forecaster.model_stage = ModelStage.BENCHMARK
+                if hasattr(forecaster, "is_out_of_sample_validated"):
+                    forecaster.is_out_of_sample_validated = False
+                rec = OOSValidationRecord(
+                    metric_name="Max_MAE",
+                    metric_value=999.0,
+                    threshold=effective_threshold,
+                    passed=False,
+                    evaluation_date=eval_date,
+                    test_sample_count=len(samples),
+                    validation_type=ValidationExecutionType.FORMAL_PRODUCTION_AUDIT,
+                    validation_conclusion="REJECTED_SYNTHETIC_OR_SELF_GENERATED",
+                    rejection_reason=rejection
+                )
+                return {
+                    "status": "VALIDATION_REJECTED",
+                    "passed": False,
+                    "threshold": effective_threshold,
+                    "rejection_reason": rejection,
+                    "validation_record": rec,
                     "model_stage": forecaster.model_stage.value
                 }
+            else:
+                effective_execution_type = ValidationExecutionType.TEST_ONLY
 
         # 第 3 步：独立样本外评测 (Independent OOS Testing)
         # 提取特征矩阵与标签
@@ -426,11 +641,14 @@ class ModelValidationService:
         naive_max_mae = max(naive_mae_by_horizon.values()) if naive_mae_by_horizon else 999.0
 
         # 第 4 步：生产准入硬性上限与基准对照 (Fixed Production Ceiling & Benchmark Beat)
-        # 调用方即使传入更大的 max_allowed_mae，也不得放宽生产上限 PRODUCTION_MAX_MAE_CEILING
-        if max_allowed_mae is not None:
-            effective_threshold = min(float(max_allowed_mae), self.PRODUCTION_MAX_MAE_CEILING)
+        # 正式生产准入时，调用方即使传入更大的 max_allowed_mae，也不得放宽生产上限 PRODUCTION_MAX_MAE_CEILING
+        if effective_execution_type == ValidationExecutionType.FORMAL_PRODUCTION_AUDIT:
+            if max_allowed_mae is not None:
+                effective_threshold = min(float(max_allowed_mae), self.PRODUCTION_MAX_MAE_CEILING)
+            else:
+                effective_threshold = self.PRODUCTION_MAX_MAE_CEILING
         else:
-            effective_threshold = self.PRODUCTION_MAX_MAE_CEILING
+            effective_threshold = float(max_allowed_mae) if max_allowed_mae is not None else self.PRODUCTION_MAX_MAE_CEILING
 
         beats_benchmark = bool(max_mae < naive_max_mae)
         passed_threshold = bool(max_mae <= effective_threshold)
@@ -500,18 +718,22 @@ class ModelValidationService:
         provenance_records: Optional[List[Any]] = None,
         min_c_index: Optional[float] = None,
         evaluation_date: Optional[date] = None,
-        execution_type: ValidationExecutionType = ValidationExecutionType.FORMAL_PRODUCTION_AUDIT
+        execution_type: ValidationExecutionType = ValidationExecutionType.FORMAL_PRODUCTION_AUDIT,
+        registered_dataset_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """对 Cox 企业生存风险分析模型执行独立的生产准入审计与样本外 C-index 验证"""
         eval_date = evaluation_date or date.today()
 
-        if validation_cohort_df is None or len(validation_cohort_df) == 0:
+        if validation_cohort_df is None or (isinstance(validation_cohort_df, pd.DataFrame) and len(validation_cohort_df) == 0):
             return {
                 "status": "VALIDATION_FAILED",
                 "passed": False,
                 "rejection_reason": "未提供有效的样本外验证企业队列。",
                 "model_stage": survival_engine.model_stage.value
             }
+
+        # 检查是否传入显式 registered_dataset_id
+        target_reg_id = registered_dataset_id or (validation_cohort_df if isinstance(validation_cohort_df, str) else None)
 
         if duration_col not in validation_cohort_df.columns or event_col not in validation_cohort_df.columns:
             return {
@@ -531,7 +753,13 @@ class ModelValidationService:
         ))
         c_val = round(c_val, 4)
 
-        # 检查真实血缘记录
+        # 生产准入硬性下限：min_c_index 即使传入更低数值，也不得低于 PRODUCTION_MIN_C_INDEX_FLOOR
+        if min_c_index is not None:
+            effective_min_c = max(float(min_c_index), self.PRODUCTION_MIN_C_INDEX_FLOOR)
+        else:
+            effective_min_c = self.PRODUCTION_MIN_C_INDEX_FLOOR
+
+        # 检查真实血缘记录 (P1-01 规范：未提供经核验血缘记录直接阻断)
         has_provenance = bool(provenance_records and len(provenance_records) >= len(validation_cohort_df))
         if has_provenance:
             for idx, prov in enumerate(provenance_records):
@@ -550,7 +778,7 @@ class ModelValidationService:
             rec = OOSValidationRecord(
                 metric_name="Concordance_Index",
                 metric_value=c_val,
-                threshold=self.PRODUCTION_MIN_C_INDEX_FLOOR,
+                threshold=effective_min_c,
                 passed=False,
                 evaluation_date=eval_date,
                 test_sample_count=len(validation_cohort_df),
@@ -566,16 +794,82 @@ class ModelValidationService:
                 "status": "VALIDATION_REJECTED",
                 "passed": False,
                 "c_index": c_val,
+                "threshold": effective_min_c,
                 "validation_record": rec,
                 "rejection_reason": rejection,
                 "model_stage": survival_engine.model_stage.value
             }
 
-        # 生产准入硬性下限：min_c_index 即使传入更低数值，也不得低于 PRODUCTION_MIN_C_INDEX_FLOOR
-        if min_c_index is not None:
-            effective_min_c = max(float(min_c_index), self.PRODUCTION_MIN_C_INDEX_FLOOR)
-        else:
-            effective_min_c = self.PRODUCTION_MIN_C_INDEX_FLOOR
+        # 正式生产准入门禁检查 (P0-01 / P1-01 准入审计规范)
+        if execution_type == ValidationExecutionType.FORMAL_PRODUCTION_AUDIT:
+            if not target_reg_id or not TrustedValidationRegistry.contains(target_reg_id):
+                rejection = (
+                    "正式生产准入门禁拒绝：验证企业队列未在可信注册中心登记。"
+                    "调用方自报 VERIFIED 状态、普通 DataFrame 或自制血缘记录无法取得生产准入资格。"
+                )
+                if hasattr(survival_engine, "model_stage") and survival_engine.model_stage == ModelStage.VERIFIED_PRODUCTION:
+                    survival_engine.model_stage = ModelStage.BENCHMARK
+                if hasattr(survival_engine, "is_out_of_sample_validated"):
+                    survival_engine.is_out_of_sample_validated = False
+                rec = OOSValidationRecord(
+                    metric_name="Concordance_Index",
+                    metric_value=c_val,
+                    threshold=effective_min_c,
+                    passed=False,
+                    evaluation_date=eval_date,
+                    test_sample_count=len(validation_cohort_df),
+                    validation_type=ValidationExecutionType.FORMAL_PRODUCTION_AUDIT,
+                    benchmark_metric_value=0.50,
+                    benchmark_name="Random_Concordance",
+                    beats_benchmark=bool(c_val > 0.50),
+                    validation_conclusion="REJECTED_UNREGISTERED_DATASET",
+                    rejection_reason=rejection,
+                    details={"c_index": c_val}
+                )
+                return {
+                    "status": "VALIDATION_REJECTED",
+                    "passed": False,
+                    "c_index": c_val,
+                    "threshold": effective_min_c,
+                    "validation_record": rec,
+                    "rejection_reason": rejection,
+                    "model_stage": survival_engine.model_stage.value
+                }
+
+            reg = TrustedValidationRegistry.get(target_reg_id)
+            if not getattr(reg, "is_audited_production_ready", False) or getattr(reg, "audit_status", None) not in [DataQualityStatus.VERIFIED, "VERIFIED"]:
+                rejection = (
+                    "正式生产准入门禁拒绝：当前企业队列为系统内置示例数据集或未获得独立生产审计证书 (has_independent_audit_certificate=False)。"
+                    "目前尚未建立权威真实生产审计数据来源时，正式生产验证入口保持关闭。"
+                )
+                if hasattr(survival_engine, "model_stage") and survival_engine.model_stage == ModelStage.VERIFIED_PRODUCTION:
+                    survival_engine.model_stage = ModelStage.BENCHMARK
+                if hasattr(survival_engine, "is_out_of_sample_validated"):
+                    survival_engine.is_out_of_sample_validated = False
+                rec = OOSValidationRecord(
+                    metric_name="Concordance_Index",
+                    metric_value=c_val,
+                    threshold=effective_min_c,
+                    passed=False,
+                    evaluation_date=eval_date,
+                    test_sample_count=len(validation_cohort_df),
+                    validation_type=ValidationExecutionType.FORMAL_PRODUCTION_AUDIT,
+                    benchmark_metric_value=0.50,
+                    benchmark_name="Random_Concordance",
+                    beats_benchmark=bool(c_val > 0.50),
+                    validation_conclusion="REJECTED_DATASET_NOT_AUDITED_FOR_PRODUCTION",
+                    rejection_reason=rejection,
+                    details={"c_index": c_val}
+                )
+                return {
+                    "status": "VALIDATION_REJECTED",
+                    "passed": False,
+                    "c_index": c_val,
+                    "threshold": effective_min_c,
+                    "validation_record": rec,
+                    "rejection_reason": rejection,
+                    "model_stage": survival_engine.model_stage.value
+                }
 
         beats_random = bool(c_val > 0.50)
         passed_threshold = bool(c_val >= effective_min_c)
@@ -633,36 +927,62 @@ class ModelValidationService:
         raw_data: Union[OOSValidationDataset, List[OOSValidationSample], pd.DataFrame, Dict[str, Any], str, None],
         registered_dataset_id: Optional[str] = None
     ) -> Tuple[List[OOSValidationSample], Dict[str, Any]]:
-        """标准化解析样本外验证数据，优先通过可信注册中心审计检索"""
+        """标准化解析样本外验证数据，优先通过可信注册中心受控读取"""
         meta = {}
         target_id = registered_dataset_id or (raw_data if isinstance(raw_data, str) else None)
         if target_id:
             reg = TrustedValidationRegistry.get(target_id)
             if reg is not None:
+                actual_hash = compute_samples_checksum(reg.samples)
                 meta["dataset_id"] = reg.dataset_id
                 meta["dataset_version"] = reg.dataset_version
                 meta["audit_status"] = reg.audit_status
                 meta["is_registered"] = True
                 meta["is_synthetic"] = reg.is_synthetic
                 meta["checksum_sha256"] = reg.checksum_sha256
+                meta["sample_count"] = len(reg.samples)
+                meta["is_audited_production_ready"] = bool(getattr(reg, "is_audited_production_ready", False))
+                meta["tampered"] = bool(reg.checksum_sha256 and actual_hash.lower() != reg.checksum_sha256.lower())
                 return reg.samples, meta
             meta["is_registered"] = False
             meta["audit_status"] = DataQualityStatus.UNVERIFIED
+            meta["is_audited_production_ready"] = False
             return [], meta
 
         if isinstance(raw_data, OOSValidationDataset):
             meta["dataset_id"] = raw_data.dataset_id
             meta["dataset_version"] = raw_data.dataset_version
             meta["is_synthetic"] = raw_data.is_synthetic
-            is_reg = TrustedValidationRegistry.contains(raw_data.dataset_id) or raw_data.is_registered
+            
+            # 安全准则：严禁以 raw_data.is_registered 作为已注册判断依据！
+            # 只有当 TrustedValidationRegistry 真正登记了该 dataset_id 时才视为已注册
+            is_reg = TrustedValidationRegistry.contains(raw_data.dataset_id)
             meta["is_registered"] = is_reg
-            meta["audit_status"] = DataQualityStatus.VERIFIED if is_reg else raw_data.audit_status
-            meta["checksum_sha256"] = raw_data.checksum_sha256
-            return raw_data.samples, meta
+            if is_reg:
+                reg = TrustedValidationRegistry.get(raw_data.dataset_id)
+                meta["audit_status"] = reg.audit_status
+                meta["is_audited_production_ready"] = bool(getattr(reg, "is_audited_production_ready", False))
+                # 检查调用方是否偷换了样本内容
+                caller_hash = compute_samples_checksum(raw_data.samples)
+                if reg.checksum_sha256 and caller_hash.lower() != reg.checksum_sha256.lower():
+                    meta["sample_substituted"] = True
+                # 正式验证必须读取注册记录中的受控真实样本，绝不接受调用方替换后的样本对象
+                actual_hash = compute_samples_checksum(reg.samples)
+                meta["tampered"] = bool(reg.checksum_sha256 and actual_hash.lower() != reg.checksum_sha256.lower())
+                meta["checksum_sha256"] = reg.checksum_sha256
+                meta["sample_count"] = len(reg.samples)
+                return reg.samples, meta
+            else:
+                meta["audit_status"] = DataQualityStatus.UNVERIFIED
+                meta["is_audited_production_ready"] = False
+                meta["checksum_sha256"] = compute_samples_checksum(raw_data.samples)
+                meta["sample_count"] = len(raw_data.samples)
+                return raw_data.samples, meta
 
         if isinstance(raw_data, list):
             meta["is_registered"] = False
             meta["audit_status"] = DataQualityStatus.UNVERIFIED
+            meta["is_audited_production_ready"] = False
             meta["is_synthetic"] = False
             samples = []
             for item in raw_data:
@@ -670,6 +990,8 @@ class ModelValidationService:
                     samples.append(item)
                 elif isinstance(item, dict):
                     samples.append(OOSValidationSample(**item))
+            meta["checksum_sha256"] = compute_samples_checksum(samples)
+            meta["sample_count"] = len(samples)
             return samples, meta
 
         if isinstance(raw_data, pd.DataFrame):

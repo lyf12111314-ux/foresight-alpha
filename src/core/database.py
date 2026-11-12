@@ -456,8 +456,9 @@ class DatabaseManager:
                 else:
                     # 表中无数据质量/核验标识，在严格校验下拒绝未核验时序数据
                     sql += " AND 1 = 0"
-            except Exception:
-                pass
+            except Exception as e:
+                # 严格模式下严禁静默忽略元数据检查异常，防止放宽过滤导致未核验数据或未来信息泄漏
+                raise RuntimeError(f"Point-in-Time 严格审计模式错误: 无法检查表 '{table_name}' 的数据质量元数据: {e}")
 
         try:
             cols_info = self.query_df(f"PRAGMA table_info('{table_name}')")

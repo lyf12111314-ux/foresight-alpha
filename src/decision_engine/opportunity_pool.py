@@ -118,15 +118,18 @@ class OpportunityPoolManager:
                         "stage_description": "历史样本不足4期或最新文献量为0，禁止虚构增长倍数"
                     }
 
-                # LightGBM 多维特征成长预测器 (准入控制：未用真实样本训练前严禁输出预测倍数)
+                # LightGBM 多维特征成长预测器 (使用当时实际可得指标构建，杜绝固定经验值冒充)
+                entropy_val = float(topic_metrics["entropy_score"].iloc[-1]) if (not topic_metrics.empty and "entropy_score" in topic_metrics and pd.notna(topic_metrics["entropy_score"].iloc[-1])) else 0.0
+                novelty_val = float(topic_metrics["novelty_score"].iloc[-1]) if (not topic_metrics.empty and "novelty_score" in topic_metrics and pd.notna(topic_metrics["novelty_score"].iloc[-1])) else 0.0
+
                 lgbm_features = {
-                    "velocity_1y": inflection_res.get("latest_velocity_yoy", 0.0),
-                    "acceleration": inflection_res.get("latest_acceleration", 0.0),
-                    "active_institutions": float(topic_metrics["active_institutions"].iloc[-1]) if not topic_metrics.empty else 0.0,
-                    "github_momentum": float(topic_metrics["github_stars"].iloc[-1]) if not topic_metrics.empty else 0.0,
+                    "velocity_1y": float(inflection_res.get("latest_velocity_yoy", 0.0)),
+                    "acceleration": float(inflection_res.get("latest_acceleration", 0.0)),
+                    "active_institutions": float(topic_metrics["active_institutions"].iloc[-1]) if (not topic_metrics.empty and "active_institutions" in topic_metrics) else 0.0,
+                    "github_momentum": float(topic_metrics["github_stars"].iloc[-1]) if (not topic_metrics.empty and "github_stars" in topic_metrics) else 0.0,
                     "macro_multiplier": float(latest_macro.get("macro_growth_multiplier", 1.0)),
-                    "entropy_score": 0.60,
-                    "novelty_score": 0.70
+                    "entropy_score": entropy_val,
+                    "novelty_score": novelty_val
                 }
                 forecaster_pred = self.lgbm_forecaster.predict_growth(lgbm_features)
 
@@ -236,6 +239,13 @@ class OpportunityPoolManager:
                 synthesized["legal_assets"] = mapped_assets
                 synthesized["inflection_evidence"] = inflection_res.get("evidence", {})
                 synthesized["survival_status"] = survival_res.get("status", "INSUFFICIENT_DATA")
+                synthesized["features"] = lgbm_features
+                synthesized["feature_version"] = f"feat_{cutoff_date.strftime('%Y%m%d')}_{tid}"
+                synthesized["feature_published_at"] = (
+                    topic_metrics["published_at"].iloc[-1]
+                    if (not topic_metrics.empty and "published_at" in topic_metrics)
+                    else None
+                )
 
                 # 持久化记录到 model_forecasts (不可变版本化存储，防止静默覆盖)
                 fc = synthesized["forecast_record"]
