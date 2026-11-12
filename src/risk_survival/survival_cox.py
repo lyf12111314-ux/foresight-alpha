@@ -19,7 +19,9 @@ from src.core.types import (
     DataQualityStatus,
     DistressEventType,
     ModelVerificationInfo,
-    OOSValidationRecord
+    OOSValidationRecord,
+    ValidationExecutionType,
+    PredictionStatus
 )
 
 
@@ -210,79 +212,61 @@ class CompanySurvivalEngine:
         oos_cohort_df: pd.DataFrame,
         duration_col: str = "duration",
         event_col: str = "event",
-        min_c_index: float = 0.55,
-        evaluation_date: Optional[date] = None
+        provenance_records: Optional[List[Any]] = None,
+        min_c_index: Optional[float] = None,
+        evaluation_date: Optional[date] = None,
+        execution_type: ValidationExecutionType = ValidationExecutionType.FORMAL_PRODUCTION_AUDIT
     ) -> Dict[str, Any]:
-        """样本外跨周期生存分析验证门禁 (OOS Concordance Index Validation).
+        """样本外跨周期生存分析验证门禁 (OOS Concordance Index Validation - 审计级实施).
         
-        要求独立样本外队列的 C-index >= min_c_index (默认 0.55)，方允许晋升为正式生产模型。
+        要求独立样本外队列经过血缘审计且 C-index >= 0.60，方允许晋升为正式生产模型。
         """
         if not self.is_algorithm_fitted or not self.is_data_verified or not self.is_fitted:
             return {
                 "status": "VALIDATION_FAILED",
                 "model_stage": self.model_stage.value,
                 "passed": False,
+                "rejection_reason": "生存模型尚未完成真实验证基准拟合，无法执行样本外检验。",
                 "message": "生存模型尚未完成真实验证基准拟合，无法执行样本外检验。"
             }
 
-        if oos_cohort_df is None or len(oos_cohort_df) == 0:
-            return {
-                "status": "VALIDATION_FAILED",
-                "model_stage": self.model_stage.value,
-                "passed": False,
-                "message": "未提供有效的样本外测试队列。"
-            }
-
-        if duration_col not in oos_cohort_df.columns or event_col not in oos_cohort_df.columns:
-            return {
-                "status": "VALIDATION_FAILED",
-                "model_stage": self.model_stage.value,
-                "passed": False,
-                "message": f"测试队列缺少必要字段 [{duration_col}, {event_col}]。"
-            }
-
-        from lifelines.utils import concordance_index
-        risk_scores = self.cph.predict_partial_hazard(oos_cohort_df)
-        c_val = float(concordance_index(
-            event_times=oos_cohort_df[duration_col],
-            predicted_scores=-risk_scores,
-            event_observed=oos_cohort_df[event_col]
-        ))
-        c_val = round(c_val, 4)
-        passed = bool(c_val >= min_c_index)
-
-        rec = OOSValidationRecord(
-            metric_name="Concordance_Index",
-            metric_value=c_val,
-            threshold=min_c_index,
-            passed=passed,
-            evaluation_date=evaluation_date or date.today(),
-            test_sample_count=len(oos_cohort_df),
-            details={"c_index": c_val, "min_required": min_c_index}
+        from src.decision_engine.model_validator import ModelValidationService
+        validator = ModelValidationService()
+        audit_res = validator.audit_and_validate_cox(
+            survival_engine=self,
+            validation_cohort_df=oos_cohort_df,
+            duration_col=duration_col,
+            event_col=event_col,
+            provenance_records=provenance_records,
+            min_c_index=min_c_index,
+            evaluation_date=evaluation_date,
+            execution_type=execution_type
         )
+
+        rec = audit_res.get("validation_record")
         self.oos_validation = rec
 
-        if passed:
+        if audit_res.get("passed") is True:
             self.is_out_of_sample_validated = True
             self.model_stage = ModelStage.VERIFIED_PRODUCTION
             return {
                 "status": "PROMOTED_TO_PRODUCTION",
                 "model_stage": self.model_stage.value,
                 "passed": True,
-                "c_index": c_val,
-                "min_required": min_c_index,
-                "message": f"样本外跨周期生存验证通过 (C-index: {c_val} >= {min_c_index})，模型晋升为正式生产验证状态。"
+                "c_index": audit_res.get("c_index"),
+                "min_required": audit_res.get("threshold"),
+                "message": f"样本外跨周期生存验证通过 (C-index: {audit_res.get('c_index')} >= {audit_res.get('threshold')})，模型晋升为正式生产验证状态。"
             }
         else:
             self.is_out_of_sample_validated = False
-            self.model_stage = ModelStage.BENCHMARK
             return {
-                "status": "OOS_VALIDATION_FAILED",
+                "status": audit_res.get("status", "OOS_VALIDATION_FAILED"),
                 "model_stage": self.model_stage.value,
                 "passed": False,
-                "c_index": c_val,
-                "min_required": min_c_index,
-                "message": f"样本外跨周期生存验证未达标 (C-index: {c_val} < {min_c_index})，保持基准模型状态，禁止用于正式预测。"
+                "c_index": audit_res.get("c_index"),
+                "min_required": audit_res.get("threshold"),
+                "rejection_reason": audit_res.get("rejection_reason"),
+                "message": f"样本外跨周期生存验证未通过：{audit_res.get('rejection_reason')}，保持基准模型状态，禁止用于正式预测。"
             }
             self.training_status = ModelTrainingStatus.INSUFFICIENT_DATA
             self.model_stage = ModelStage.UNTRAINED
@@ -423,26 +407,47 @@ class CompanySurvivalEngine:
                 "disclaimer": "本系统未在真实破产清算与违约事件样本上完成统计校准前，严格禁止虚构破产概率。"
             }
 
+        # 严格检查核心财务与经营协变量完整性 (严禁在财务数据缺失时使用默认数值填充替代)
+        financial_covariates = ["debt_ratio", "gross_margin"]
+        missing_covs = [c for c in financial_covariates if c not in company_metrics or company_metrics[c] is None]
+        if missing_covs:
+            return {
+                "status": PredictionStatus.INSUFFICIENT_DATA.value,
+                "model_stage": self.model_stage.value,
+                "is_verified": False,
+                "is_synthetic": self.is_synthetic,
+                "dataset_version": self.dataset_version,
+                "model_version": self.model_version,
+                "partial_hazard_ratio": None,
+                "risk_tier": "DATA_INSUFFICIENT",
+                "survival_probabilities": {
+                    "surv_1y": None,
+                    "surv_3y": None,
+                    "surv_5y": None
+                },
+                "risk_assessment": f"企业关键财务指标缺失 ({missing_covs})，拒绝使用默认数值填充，以保证风险评估可信度。",
+                "hazard_factor_multipliers": {},
+                "disclaimer": "财务数据缺失时拒绝输出企业破产预测以维护决策可信度。"
+            }
+
         sample_df = pd.DataFrame([{
-            "cash_burn_months": company_metrics.get("cash_burn_months", 24.0),
-            "debt_ratio": company_metrics.get("debt_ratio", 45.0),
-            "gross_margin": company_metrics.get("gross_margin", 35.0),
-            "competitor_count": company_metrics.get("competitor_count", 10.0)
+            "cash_burn_months": float(company_metrics.get("cash_burn_months", 24.0)),
+            "debt_ratio": float(company_metrics["debt_ratio"]),
+            "gross_margin": float(company_metrics["gross_margin"]),
+            "competitor_count": float(company_metrics.get("competitor_count", 1.0))
         }])
 
         surv_func = self.cph.predict_survival_function(sample_df)
 
-        # P0-04: 同步时间单位至月份 (1年=12月, 3年=36月, 5年=60月)，阶梯函数右连续估值与右截尾保护
+        # 严格标准化时间单位为月份 (MONTHS: 1年=12月, 3年=36月, 5年=60月)，消除 >15 启发式引发的单位混淆
         min_observed_dur = float(surv_func.index.min()) if not surv_func.empty else 0.0
         max_observed_dur = float(surv_func.index.max()) if not surv_func.empty else 0.0
-        is_in_months = (max_observed_dur > 15.0)
-        time_unit = "MONTHS" if is_in_months else "YEARS"
+        time_unit = "MONTHS"
 
         horizon_months = {"surv_1y": 12.0, "surv_3y": 36.0, "surv_5y": 60.0}
         survival_probs = {}
 
-        for key, t_months in horizon_months.items():
-            t_eval = t_months if is_in_months else (t_months / 12.0)
+        for key, t_eval in horizon_months.items():
             if t_eval < min_observed_dur:
                 # 在首次违约/破产事件发生前，全队列存活概率为 1.0 (右连续阶梯函数初始平台)
                 survival_probs[key] = 1.0

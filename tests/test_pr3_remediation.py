@@ -242,14 +242,26 @@ def test_p0_02_model_promotion_requires_oos_validation():
     assert forecaster.model_stage == ModelStage.BENCHMARK
     assert forecaster.is_out_of_sample_validated is False
 
-    # 样本外检验 (OOS) - 成功达标情形
-    # 使用与训练集相同分布数据使 MAE 保持低位
+    # 样本外检验 (OOS) - 成功达标情形 (提供经核验的独立样本外血缘凭证)
+    oos_provenances = [
+        ProvenanceMetadata(
+            record_id=f"OOS_REC_{i}",
+            source_name="Audited_OOS_Archive",
+            as_of_date=date(2021, 1, 1),
+            published_at=datetime(2021, 1, 2),
+            quality_status=DataQualityStatus.VERIFIED,
+            raw_hash="fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+        )
+        for i in range(10)
+    ]
     oos_good_labels = {
         1: forecaster.models[1].predict(oos_feat) + 0.1,
         3: forecaster.models[3].predict(oos_feat) + 0.1,
         5: forecaster.models[5].predict(oos_feat) + 0.1
     }
-    res_oos_pass = forecaster.validate_out_of_sample(oos_feat, oos_good_labels, max_allowed_mae=2.0)
+    res_oos_pass = forecaster.validate_out_of_sample(
+        oos_feat, oos_good_labels, max_allowed_mae=2.0, provenance_records=oos_provenances
+    )
     assert res_oos_pass["passed"] is True
     assert forecaster.model_stage == ModelStage.VERIFIED_PRODUCTION
     assert forecaster.is_out_of_sample_validated is True

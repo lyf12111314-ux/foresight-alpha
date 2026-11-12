@@ -34,11 +34,26 @@ class DataQualityStatus(str, Enum):
 
 class PredictionStatus(str, Enum):
     """预测准入状态"""
-    PREDICTED = "PREDICTED"                         # 经过验证模型生成的正式预测
-    NOT_PREDICTABLE = "NOT_PREDICTABLE"             # 数据不足，标记为不可预测
-    MODEL_NOT_TRAINED = "MODEL_NOT_TRAINED"         # 模型尚未训练，禁止输出正式预测
-    UNVERIFIED_RESEARCH = "UNVERIFIED_RESEARCH"     # 仅供研究参考的未验证估计
-    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"         # 历史数据不足以支撑推演
+    PREDICTED = "PREDICTED"                                         # 经过验证模型生成的正式预测
+    NOT_PREDICTABLE = "NOT_PREDICTABLE"                             # 数据不足，标记为不可预测
+    MODEL_NOT_TRAINED = "MODEL_NOT_TRAINED"                         # 模型尚未训练，禁止输出正式预测
+    MODEL_UNAVAILABLE_AS_OF_DATE = "MODEL_UNAVAILABLE_AS_OF_DATE"   # 历史时点尚无可用模型
+    UNVERIFIED_RESEARCH = "UNVERIFIED_RESEARCH"                     # 仅供研究参考的未验证估计
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"                         # 历史数据不足以支撑推演
+
+
+class ValidationExecutionType(str, Enum):
+    """验证执行类型 (严格区分正式生产晋升与工程/模拟测试)"""
+    FORMAL_PRODUCTION_AUDIT = "FORMAL_PRODUCTION_AUDIT"             # 正式生产准入验证
+    TEST_ONLY = "TEST_ONLY"                                         # 工程与代码逻辑测试专用
+    EXPERIMENTAL = "EXPERIMENTAL"                                   # 实验性研究验证
+
+
+class SimulationType(str, Enum):
+    """非对称收益模拟类型"""
+    FORMAL_PREDICTION = "FORMAL_PREDICTION"                         # 基于生产级预测的正式测算
+    HYPOTHETICAL_SCENARIO = "HYPOTHETICAL_SCENARIO"                 # 人工设定假设情景推演
+    EXPERIMENTAL_RESEARCH = "EXPERIMENTAL_RESEARCH"                 # 实验性研究估算
 
 
 class ModelStage(str, Enum):
@@ -75,14 +90,56 @@ class DistressEventType(str, Enum):
     CENSORED_ACTIVE = "CENSORED_ACTIVE"                             # 正常存续/右删失 (未发生终结性违约事件)
 
 
+class OOSValidationSample(BaseModel):
+    """独立样本外验证单样本元数据结构 (P0-01 准入审计规范)"""
+    sample_id: str
+    dataset_version: str
+    feature_snapshot_id: str
+    decision_date: date
+    feature_available_at: datetime
+    label_period_end: date
+    label_observed_at: datetime
+    label_source: str
+    label_quality_status: DataQualityStatus
+    source_record_id: str
+    data_quality_status: DataQualityStatus
+    topic_id: Optional[str] = None
+    features: Dict[str, float] = Field(default_factory=dict)
+    labels: Dict[int, Optional[float]] = Field(default_factory=dict)
+    is_synthetic: bool = False
+    is_model_generated: bool = False
+
+
+class OOSValidationDataset(BaseModel):
+    """独立样本外验证数据集 (P0-01 准入审计规范)"""
+    dataset_id: str
+    dataset_version: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    audit_status: DataQualityStatus = DataQualityStatus.UNVERIFIED
+    samples: List[OOSValidationSample] = Field(default_factory=list)
+    source_archive: str = "Independent_OOS_Audit_Vault"
+    is_synthetic: bool = False
+
+
 class OOSValidationRecord(BaseModel):
-    """样本外跨周期验证评估记录"""
+    """样本外跨周期验证评估记录 (全面审计追踪)"""
     metric_name: str
     metric_value: float
     threshold: float
     passed: bool
     evaluation_date: date
     test_sample_count: int
+    validation_type: ValidationExecutionType = ValidationExecutionType.FORMAL_PRODUCTION_AUDIT
+    model_version: str = "v1.1-p0"
+    training_dataset_version: Optional[str] = None
+    test_dataset_version: Optional[str] = None
+    training_cutoff_date: Optional[date] = None
+    validation_executed_at: datetime = Field(default_factory=datetime.utcnow)
+    benchmark_metric_value: Optional[float] = None
+    benchmark_name: Optional[str] = None
+    beats_benchmark: bool = False
+    validation_conclusion: str = "PENDING"
+    rejection_reason: Optional[str] = None
     details: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -119,6 +176,7 @@ class ModelTrainingStatus(str, Enum):
     """模型训练状态 (兼容原有接口)"""
     TRAINED = "TRAINED"                             # 已完成训练
     MODEL_NOT_TRAINED = "MODEL_NOT_TRAINED"         # 模型未训练
+    MODEL_UNAVAILABLE_AS_OF_DATE = "MODEL_UNAVAILABLE_AS_OF_DATE"   # 历史时点尚无可用模型
     INSUFFICIENT_DATA = "INSUFFICIENT_DATA"         # 真实样本不足无法训练
     EXPERIMENTAL = "EXPERIMENTAL"                   # 实验模式拟合 (非正式生产)
 

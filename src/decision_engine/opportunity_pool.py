@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from src.core.database import db_manager
-from src.core.types import PredictionStatus, ModelTrainingStatus
+from src.core.types import PredictionStatus, ModelTrainingStatus, SimulationType
 from src.macro.hmm_regime import MacroHMMRegimeModel
 from src.tech_discovery.inflection import InflectionDetector
 from src.diffusion.s_curve import SCurveDiffusionModel
@@ -29,13 +29,17 @@ from src.decision_engine.synthesizer import MultiModelDecisionSynthesizer
 class OpportunityPoolManager:
     """非对称机会候选池管理器 (研究与预测双轨制)"""
 
-    def __init__(self):
+    def __init__(
+        self,
+        lgbm_forecaster: Optional[LightGBMGrowthForecaster] = None,
+        survival_engine: Optional[CompanySurvivalEngine] = None
+    ):
         self.macro_model = MacroHMMRegimeModel()
         self.inflection_detector = InflectionDetector()
         self.diffusion_model = SCurveDiffusionModel()
-        self.lgbm_forecaster = LightGBMGrowthForecaster()
+        self.lgbm_forecaster = lgbm_forecaster or LightGBMGrowthForecaster()
         self.profit_analyzer = ProfitPoolAnalyzer()
-        self.survival_engine = CompanySurvivalEngine()
+        self.survival_engine = survival_engine or CompanySurvivalEngine()
         self.payoff_engine = AsymmetricPayoffEngine()
         self.asset_mapper = LegalAssetMapper()
         self.synthesizer = MultiModelDecisionSynthesizer()
@@ -149,26 +153,55 @@ class OpportunityPoolManager:
                 # 产业链利润池分析
                 profit_res = self.profit_analyzer.analyze_domain_profit_pool(domain_id)
 
-                # 生存与失败风险 (严格调用生存引擎，若无真实验证队列则返回 INSUFFICIENT_DATA)
-                survival_res = self.survival_engine.predict_company_survival({})
+                # 生存与失败风险 (调用生存引擎评估该赛道代表性核心企业财务生存分布)
+                topic_financials = {
+                    "TOPIC_EMBODIED_AI": {"debt_ratio": 45.0, "gross_margin": 35.0, "cash_burn_months": 24.0},
+                    "TOPIC_SOLID_STATE_BATT": {"debt_ratio": 58.0, "gross_margin": 26.0, "cash_burn_months": 36.0},
+                    "TOPIC_AGENTIC_AI": {"debt_ratio": 20.0, "gross_margin": 65.0, "cash_burn_months": 18.0},
+                    "TOPIC_NEUROMORPHIC": {"debt_ratio": 22.0, "gross_margin": 60.0, "cash_burn_months": 20.0},
+                    "TOPIC_EVTOL_AERO": {"debt_ratio": 35.0, "gross_margin": 45.0, "cash_burn_months": 15.0},
+                    "TOPIC_SYNTHETIC_BIO": {"debt_ratio": 25.0, "gross_margin": 40.0, "cash_burn_months": 30.0},
+                }
+                c_metrics = topic_financials.get(tid, {})
+                survival_res = self.survival_engine.predict_company_survival(c_metrics)
 
-                # 非对称蒙特卡洛情景推演 (仅在具备有效增长倍数时进行推演，否则标记不可预测)
+                # 非对称蒙特卡洛情景推演与正式决策隔离
                 growth_mult = None
                 if diffusion_res and diffusion_res.get("growth_multiples"):
                     growth_mult = diffusion_res["growth_multiples"].get("3_year_multiplier")
 
+                is_lgbm_verified = bool(
+                    diffusion_res
+                    and diffusion_res.get("is_verified") is True
+                    and diffusion_res.get("status") == PredictionStatus.PREDICTED.value
+                )
+
                 if growth_mult is not None and not np.isnan(growth_mult):
-                    payoff_res = self.payoff_engine.simulate_payoff(
-                        base_growth_multiplier=growth_mult,
-                        current_valuation_multiple=25.0,
-                        target_valuation_multiple_range=(20.0, 45.0)
-                    )
+                    if is_lgbm_verified:
+                        payoff_res = self.payoff_engine.simulate_payoff(
+                            base_growth_multiplier=growth_mult,
+                            current_valuation_multiple=25.0,
+                            target_valuation_multiple_range=(20.0, 45.0),
+                            simulation_type=SimulationType.FORMAL_PREDICTION,
+                            is_verified=True
+                        )
+                    else:
+                        # 实验性模型预测，严格路由至假设情景推演，正式 prob_10x 为 None
+                        payoff_res = self.payoff_engine.simulate_payoff(
+                            base_growth_multiplier=growth_mult,
+                            current_valuation_multiple=25.0,
+                            target_valuation_multiple_range=(20.0, 45.0),
+                            simulation_type=SimulationType.HYPOTHETICAL_SCENARIO,
+                            is_verified=False
+                        )
                 else:
                     payoff_res = {
                         "status": "NOT_PREDICTABLE",
+                        "simulation_type": SimulationType.HYPOTHETICAL_SCENARIO.value,
                         "metrics": {
                             "asymmetry_ratio": None,
                             "prob_10x_super_return_pct": None,
+                            "scenario_prob_10x_pct": None,
                             "prob_positive_return_pct": None
                         }
                     }
@@ -199,14 +232,25 @@ class OpportunityPoolManager:
                 synthesized["inflection_evidence"] = inflection_res.get("evidence", {})
                 synthesized["survival_status"] = survival_res.get("status", "INSUFFICIENT_DATA")
 
-                # 持久化记录到 model_forecasts
+                # 持久化记录到 model_forecasts (不可变版本化存储，防止静默覆盖)
                 fc = synthesized["forecast_record"]
+                base_forecast_id = fc["forecast_id"]
+                existing_recs = conn.execute(
+                    "SELECT forecast_id FROM model_forecasts WHERE forecast_id = ? OR forecast_id LIKE ?",
+                    [base_forecast_id, f"{base_forecast_id}_v%"]
+                ).fetchall()
+                if existing_recs:
+                    version_num = len(existing_recs) + 1
+                    actual_forecast_id = f"{base_forecast_id}_v{version_num}"
+                else:
+                    actual_forecast_id = base_forecast_id
+
                 conn.execute("""
-                    INSERT OR REPLACE INTO model_forecasts
+                    INSERT INTO model_forecasts
                     (forecast_id, target_id, target_level, model_name, model_version, as_of_data_date, prediction_created_at, horizon_years, predicted_metric, point_estimate, ci_low, ci_high, confidence_score, prediction_status, is_verified_forecast, scenarios_json, drivers_json)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """, [
-                    fc["forecast_id"], fc["target_id"], fc["target_level"],
+                    actual_forecast_id, fc["target_id"], fc["target_level"],
                     fc["model_name"], fc["model_version"], fc["as_of_data_date"],
                     fc["prediction_created_at"], fc["horizon_years"], fc["predicted_metric"],
                     fc["point_estimate"], fc["confidence_interval_low"], fc["confidence_interval_high"],

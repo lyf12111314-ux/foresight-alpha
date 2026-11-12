@@ -5,11 +5,18 @@
 2. 企业收入可能增长10倍 (Company Revenue Conversion)
 3. 企业估值可能增长10倍 (Enterprise Valuation Expansion)
 4. 投资者实际取得10倍净收益 (Investor Net Realized Return, 扣除稀释与流动性摩擦)
+
+P0-02 隔离与真实性控制：
+- 严格隔离正式预测 (FORMAL_PREDICTION) 与假设情景模拟 (HYPOTHETICAL_SCENARIO)。
+- 未通过真实验证的模型 (UNVERIFIED_RESEARCH / EXPERIMENTAL)，正式 prob_10x_super_return_pct 必须为 None。
+- 绝不在正式预测中使用硬编码默认 25x/45x 估值扩张；必须携带清晰免责声明。
 """
 
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, List, Optional, Tuple
+
+from src.core.types import SimulationType
 
 
 class AsymmetricPayoffEngine:
@@ -22,12 +29,37 @@ class AsymmetricPayoffEngine:
     def simulate_payoff(
         self,
         base_growth_multiplier: float,
-        current_valuation_multiple: float,
-        target_valuation_multiple_range: Tuple[float, float],
+        current_valuation_multiple: Optional[float] = None,
+        target_valuation_multiple_range: Optional[Tuple[float, float]] = None,
         dilution_rate_est: float = 0.15,
-        exit_friction_discount: float = 0.10
+        exit_friction_discount: float = 0.10,
+        simulation_type: SimulationType = SimulationType.HYPOTHETICAL_SCENARIO,
+        is_verified: bool = False
     ) -> Dict[str, Any]:
         """执行 5000 次蒙特卡洛路径推演，计算四层转化率与分位数收益分布"""
+        sim_type_str = simulation_type.value if hasattr(simulation_type, "value") else str(simulation_type)
+        is_formal = (simulation_type == SimulationType.FORMAL_PREDICTION and is_verified)
+
+        # 正式预测严禁在缺失真实估值时使用硬编码默认值
+        if is_formal and (current_valuation_multiple is None or target_valuation_multiple_range is None):
+            return {
+                "status": "NOT_PREDICTABLE",
+                "simulation_type": sim_type_str,
+                "is_verified": False,
+                "metrics": {
+                    "prob_positive_return_pct": None,
+                    "prob_3x_return_pct": None,
+                    "prob_10x_super_return_pct": None,
+                    "scenario_prob_10x_pct": None,
+                    "prob_severe_loss_pct": None,
+                    "asymmetry_ratio": None
+                },
+                "disclaimer": "正式预测缺失真实估值乘数，拒绝虚构估值扩张与10倍收益概率。"
+            }
+
+        curr_mult = current_valuation_multiple if current_valuation_multiple is not None else 25.0
+        low_mult, high_mult = target_valuation_multiple_range if target_valuation_multiple_range is not None else (20.0, 45.0)
+
         np.random.seed(self.random_seed)
 
         # 1. 产业整体规模扩张模拟 (对数正态肥尾分布)
@@ -36,14 +68,12 @@ class AsymmetricPayoffEngine:
         sim_ind_growth = np.random.lognormal(mean=mu_ind, sigma=sigma_ind, size=self.n_simulations)
 
         # 2. 企业营收转化率 (企业是否能够跑赢或落后行业：β 与 特质冲击)
-        # 很多企业技术虽好但份额丢失或内卷，转化系数中位数约 0.70-0.90
         market_share_factor = np.random.beta(a=3, b=3, size=self.n_simulations) * 1.6
         sim_rev_growth = sim_ind_growth * market_share_factor
 
         # 3. 估值乘数扩张/收缩 (P/S 或 P/E Multiple)
-        low_mult, high_mult = target_valuation_multiple_range
         sim_exit_multiple = np.random.uniform(low_mult, high_mult, size=self.n_simulations)
-        multiple_expansion_ratio = sim_exit_multiple / max(current_valuation_multiple, 1.0)
+        multiple_expansion_ratio = sim_exit_multiple / max(curr_mult, 1.0)
         sim_enterprise_valuation_growth = sim_rev_growth * multiple_expansion_ratio
 
         # 4. 投资者实际净收益 (考虑增发稀释、交易滑点、流动性折价)
@@ -60,23 +90,36 @@ class AsymmetricPayoffEngine:
         }
 
         # 核心胜率与非对称赔率指标
-        prob_positive = float(np.mean(sim_investor_net_multiple > 1.0)) * 100.0  # 获得正收益概率
-        prob_3x = float(np.mean(sim_investor_net_multiple >= 3.0)) * 100.0       # 获得3倍以上收益概率
-        prob_10x = float(np.mean(sim_investor_net_multiple >= 10.0)) * 100.0     # 获得10倍非对称大胜概率
-        prob_loss_50 = float(np.mean(sim_investor_net_multiple <= 0.50)) * 100.0 # 亏损超过50%极端风险概率
+        prob_positive = float(np.mean(sim_investor_net_multiple > 1.0)) * 100.0
+        prob_3x = float(np.mean(sim_investor_net_multiple >= 3.0)) * 100.0
+        prob_10x = float(np.mean(sim_investor_net_multiple >= 10.0)) * 100.0
+        prob_loss_50 = float(np.mean(sim_investor_net_multiple <= 0.50)) * 100.0
 
         # 预期赔率 (上行中位数 / 下行中位数)
         upside = max(float(np.quantile(sim_investor_net_multiple, 0.90)) - 1.0, 0.1)
         downside = max(1.0 - float(np.quantile(sim_investor_net_multiple, 0.10)), 0.1)
         asymmetry_ratio = round(upside / downside, 2)
 
+        disclaimer = (
+            "基于生产级真实验证预测与估值中枢推演的收益分布估算。"
+            if is_formal else
+            "情景模拟结果仅供宏观与产业弹性敏感性参考，不构成针对特定企业的真实收益概率承诺。"
+        )
+
         return {
+            "status": "SUCCESS",
+            "simulation_type": sim_type_str,
+            "is_verified": is_formal,
+            "disclaimer": disclaimer,
             "n_simulations": self.n_simulations,
             "quantiles_breakdown": q_results,
             "metrics": {
-                "prob_positive_return_pct": round(prob_positive, 1),
-                "prob_3x_return_pct": round(prob_3x, 1),
-                "prob_10x_super_return_pct": round(prob_10x, 1),
+                "prob_positive_return_pct": round(prob_positive, 1) if is_formal else None,
+                "scenario_prob_positive_pct": round(prob_positive, 1),
+                "prob_3x_return_pct": round(prob_3x, 1) if is_formal else None,
+                "scenario_prob_3x_pct": round(prob_3x, 1),
+                "prob_10x_super_return_pct": round(prob_10x, 1) if is_formal else None,
+                "scenario_prob_10x_pct": round(prob_10x, 1),
                 "prob_severe_loss_pct": round(prob_loss_50, 1),
                 "asymmetry_ratio": asymmetry_ratio
             },

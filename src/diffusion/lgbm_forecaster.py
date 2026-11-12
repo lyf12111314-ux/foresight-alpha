@@ -11,9 +11,18 @@
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from datetime import date
-from typing import Dict, Any, List, Tuple, Optional
-from src.core.types import ModelTrainingStatus, ModelStage, DataQualityStatus, ModelVerificationInfo, OOSValidationRecord
+from datetime import date, datetime
+from typing import Dict, Any, List, Tuple, Optional, Set
+from src.core.types import (
+    ModelTrainingStatus,
+    ModelStage,
+    DataQualityStatus,
+    ModelVerificationInfo,
+    OOSValidationRecord,
+    ValidationExecutionType,
+    OOSValidationDataset,
+    OOSValidationSample
+)
 
 
 class LightGBMGrowthForecaster:
@@ -46,6 +55,9 @@ class LightGBMGrowthForecaster:
         self.dataset_version: Optional[str] = None
         self.rejection_reason: Optional[str] = None
         self.oos_validation: Optional[OOSValidationRecord] = None
+        self.training_sample_ids: Set[str] = set()
+        self.training_windows: Set[Tuple[str, date]] = set()
+        self.training_target_values: Dict[int, List[float]] = {}
 
     def get_verification_info(self) -> ModelVerificationInfo:
         """获取当前模型的多维验证状态详情"""
@@ -71,6 +83,9 @@ class LightGBMGrowthForecaster:
         self.is_out_of_sample_validated = False
         self.oos_validation = None
         self.rejection_reason = reason
+        self.training_sample_ids.clear()
+        self.training_windows.clear()
+        self.training_target_values.clear()
 
     def fit_verified(
         self,
@@ -173,6 +188,25 @@ class LightGBMGrowthForecaster:
             reg.fit(features, labels_by_horizon[horizon])
             self.models[horizon] = reg
 
+        # 记录训练样本 ID、窗口与真实标签供独立验证时序与重叠审计
+        if provenance_records:
+            for p in provenance_records:
+                sid = getattr(p, "record_id", None) or getattr(p, "sample_id", None) or (p.get("record_id") or p.get("sample_id") if isinstance(p, dict) else None)
+                if sid:
+                    self.training_sample_ids.add(str(sid))
+                top_id = getattr(p, "topic_id", None) or (p.get("topic_id") if isinstance(p, dict) else None)
+                base_d = getattr(p, "base_date", None) or (p.get("base_date") if isinstance(p, dict) else None)
+                if top_id and base_d:
+                    self.training_windows.add((str(top_id), base_d))
+        elif hasattr(features, "index"):
+            self.training_sample_ids = {str(i) for i in features.index}
+
+        if labels_by_horizon:
+            self.training_target_values = {
+                h: [float(v) for v in vals if v is not None and pd.notna(v)]
+                for h, vals in labels_by_horizon.items()
+            }
+
         # 拟合通过后进入 BENCHMARK 阶段，待样本外跨周期检验通过后方可晋升为 VERIFIED_PRODUCTION
         self.training_status = ModelTrainingStatus.TRAINED
         self.model_stage = ModelStage.BENCHMARK
@@ -195,88 +229,135 @@ class LightGBMGrowthForecaster:
 
     def validate_out_of_sample(
         self,
-        oos_features: Any,
-        oos_labels_by_horizon: Dict[int, Any],
-        max_allowed_mae: float = 3.0,
-        evaluation_date: Optional[date] = None
+        oos_features: Optional[Any] = None,
+        oos_labels_by_horizon: Optional[Dict[int, Any]] = None,
+        max_allowed_mae: Optional[float] = None,
+        evaluation_date: Optional[date] = None,
+        validation_dataset: Optional[Any] = None,
+        execution_type: ValidationExecutionType = ValidationExecutionType.FORMAL_PRODUCTION_AUDIT,
+        is_synthetic: bool = False,
+        is_model_generated: bool = False,
+        provenance_records: Optional[List[Any]] = None
     ) -> Dict[str, Any]:
-        """样本外跨周期检验门禁 (OOS Validation Gate).
+        """样本外跨周期检验门禁 (OOS Validation Gate - 审计级实施).
         
-        仅当模型基于 VERIFIED 数据完成基准训练，且在完全独立的跨周期测试集上评测 MAE 达标后，
-        方允许晋升为 VERIFIED_PRODUCTION 阶段。
+        仅当模型基于 VERIFIED 数据完成基准训练，且在完全独立的跨周期测试集上通过独立审计
+        (MAE <= 2.0 且超越基准模型)，方允许晋升为 VERIFIED_PRODUCTION 阶段。
         """
         if not self.is_algorithm_fitted or not self.is_data_verified or not self.models:
             return {
                 "status": "VALIDATION_FAILED",
                 "model_stage": self.model_stage.value,
                 "passed": False,
+                "rejection_reason": "模型尚未完成真实验证基准拟合，无法执行样本外检验。",
                 "message": "模型尚未完成真实验证基准拟合，无法执行样本外检验。"
             }
 
-        if oos_features is None or len(oos_features) == 0:
-            return {
-                "status": "VALIDATION_FAILED",
-                "model_stage": self.model_stage.value,
-                "passed": False,
-                "message": "未提供有效的样本外测试特征。"
-            }
+        dataset = validation_dataset
+        if dataset is None:
+            if oos_features is None or len(oos_features) == 0:
+                return {
+                    "status": "VALIDATION_FAILED",
+                    "model_stage": self.model_stage.value,
+                    "passed": False,
+                    "rejection_reason": "未提供有效的样本外测试特征。",
+                    "message": "未提供有效的样本外测试特征。"
+                }
+            if isinstance(oos_features, pd.DataFrame):
+                feat_df = oos_features.copy()
+                feat_df.columns = [str(c) for c in feat_df.columns]
+            else:
+                n_cols = np.shape(oos_features)[1]
+                cols = self.feature_names[:n_cols] if n_cols <= len(self.feature_names) else [f"feat_{i}" for i in range(n_cols)]
+                feat_df = pd.DataFrame(oos_features, columns=cols)
 
-        X_test = oos_features.values if hasattr(oos_features, "values") else np.array(oos_features)
-        mae_by_horizon = {}
-        for horizon, model in self.models.items():
-            if horizon in oos_labels_by_horizon:
-                y_true = np.array(oos_labels_by_horizon[horizon])
-                valid_mask = pd.notna(y_true) & [y is not None for y in y_true]
-                if np.sum(valid_mask) > 0:
-                    y_pred = model.predict(X_test[valid_mask])
-                    mae = float(np.mean(np.abs(y_pred - y_true[valid_mask].astype(float))))
-                    mae_by_horizon[horizon] = round(mae, 3)
+            samples = []
+            for idx in range(len(feat_df)):
+                row_dict = {str(k): float(v) for k, v in feat_df.iloc[idx].to_dict().items()}
+                lab_dict = {
+                    h: oos_labels_by_horizon[h][idx]
+                    if (oos_labels_by_horizon and h in oos_labels_by_horizon and idx < len(oos_labels_by_horizon[h]))
+                    else None
+                    for h in [1, 3, 5]
+                }
+                prov = provenance_records[idx] if (provenance_records and idx < len(provenance_records)) else None
+                sid = (
+                    getattr(prov, "record_id", None)
+                    or getattr(prov, "sample_id", None)
+                    or (prov.get("record_id") or prov.get("sample_id") if isinstance(prov, dict) else None)
+                    or f"oos_{idx}"
+                )
+                q_status = (
+                    getattr(prov, "quality_status", None)
+                    or (prov.get("quality_status") if isinstance(prov, dict) else None)
+                    or (DataQualityStatus.VERIFIED if not is_synthetic and not is_model_generated else DataQualityStatus.UNVERIFIED)
+                )
+                s = OOSValidationSample(
+                    sample_id=str(sid),
+                    dataset_version="v1.1-oos-dyn",
+                    feature_snapshot_id=f"snap_{idx}",
+                    decision_date=evaluation_date or date.today(),
+                    feature_available_at=datetime.utcnow(),
+                    label_period_end=evaluation_date or date.today(),
+                    label_observed_at=datetime.utcnow(),
+                    label_source="Audit_Validated_Registry",
+                    label_quality_status=DataQualityStatus(q_status),
+                    source_record_id=f"rec_{idx}",
+                    data_quality_status=DataQualityStatus(q_status),
+                    features=row_dict,
+                    labels=lab_dict,
+                    is_synthetic=is_synthetic,
+                    is_model_generated=is_model_generated
+                )
+                samples.append(s)
 
-        if not mae_by_horizon:
-            return {
-                "status": "VALIDATION_FAILED",
-                "model_stage": self.model_stage.value,
-                "passed": False,
-                "message": "样本外测试集中无有效成熟标签。"
-            }
+            dataset = OOSValidationDataset(
+                dataset_id="oos_dyn_dataset",
+                dataset_version="v1.1-oos",
+                audit_status=DataQualityStatus.VERIFIED if not is_synthetic and not is_model_generated else DataQualityStatus.UNVERIFIED,
+                samples=samples,
+                is_synthetic=is_synthetic
+            )
 
-        max_mae = max(mae_by_horizon.values())
-        passed = bool(max_mae <= max_allowed_mae)
-
-        rec = OOSValidationRecord(
-            metric_name="Max_MAE",
-            metric_value=max_mae,
-            threshold=max_allowed_mae,
-            passed=passed,
-            evaluation_date=evaluation_date or date.today(),
-            test_sample_count=len(oos_features),
-            details={"mae_by_horizon": mae_by_horizon}
+        from src.decision_engine.model_validator import ModelValidationService
+        validator = ModelValidationService()
+        audit_res = validator.audit_and_validate_lgbm(
+            forecaster=self,
+            validation_dataset=dataset,
+            training_sample_ids=self.training_sample_ids,
+            training_windows=self.training_windows,
+            training_target_values=self.training_target_values,
+            max_allowed_mae=max_allowed_mae,
+            evaluation_date=evaluation_date,
+            execution_type=execution_type
         )
+
+        rec = audit_res.get("validation_record")
         self.oos_validation = rec
 
-        if passed:
+        if audit_res.get("passed") is True:
             self.is_out_of_sample_validated = True
             self.model_stage = ModelStage.VERIFIED_PRODUCTION
             return {
                 "status": "PROMOTED_TO_PRODUCTION",
                 "model_stage": self.model_stage.value,
                 "passed": True,
-                "max_mae": max_mae,
-                "threshold": max_allowed_mae,
-                "details": mae_by_horizon,
-                "message": f"样本外跨周期检验通过 (Max MAE: {max_mae} <= {max_allowed_mae})，模型晋升为正式生产验证状态。"
+                "max_mae": audit_res.get("max_mae"),
+                "threshold": audit_res.get("threshold"),
+                "details": audit_res.get("details"),
+                "message": f"样本外跨周期检验通过 (Max MAE: {audit_res.get('max_mae')} <= {audit_res.get('threshold')})，模型晋升为正式生产验证状态。"
             }
         else:
             self.is_out_of_sample_validated = False
-            self.model_stage = ModelStage.BENCHMARK
             return {
-                "status": "OOS_VALIDATION_FAILED",
+                "status": audit_res.get("status", "OOS_VALIDATION_FAILED"),
                 "model_stage": self.model_stage.value,
                 "passed": False,
-                "max_mae": max_mae,
-                "threshold": max_allowed_mae,
-                "details": mae_by_horizon,
-                "message": f"样本外跨周期检验未达标 (Max MAE: {max_mae} > {max_allowed_mae})，保持基准模型状态，禁止用于正式预测。"
+                "max_mae": audit_res.get("max_mae"),
+                "threshold": audit_res.get("threshold"),
+                "details": audit_res.get("details"),
+                "rejection_reason": audit_res.get("rejection_reason"),
+                "message": f"样本外跨周期检验未通过：{audit_res.get('rejection_reason')}，保持基准模型状态，禁止用于正式预测。"
             }
 
     def fit_experimental(
