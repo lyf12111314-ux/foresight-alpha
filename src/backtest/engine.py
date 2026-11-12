@@ -45,7 +45,9 @@ class PointInTimeBacktestEngine:
         predicted_probs = [c.get("calibrated_probability") for c in candidates]
 
         # 2. 从真实历史数据中提取事实标签 (Ground Truth Outcome)
-        # 审查观察期终点：若 evaluation_date 尚未达到要求的预测跨度，标记为 NOT_MATURED
+        # 审查观察期终点与审计锚定日 (2026-11-11)：
+        # 若 evaluation_date 尚未达到要求的预测跨度，或超过实际审查锚定日，标记为 NOT_MATURED
+        REVIEW_AS_OF_DATE = date(2026, 11, 11)
         try:
             expected_maturity_date = date(cutoff_date.year + horizon_years, cutoff_date.month, cutoff_date.day)
         except ValueError:
@@ -56,7 +58,8 @@ class PointInTimeBacktestEngine:
         cutoff_dt = pd.to_datetime(cutoff_date)
         eval_dt = pd.to_datetime(evaluation_date)
 
-        is_matured_horizon = (evaluation_date >= expected_maturity_date)
+        # 必须满足：评估日已达到成熟观察期截止点，且评估日不超过当前历史数据审计锚定日 (杜绝未成熟与前视偏差)
+        is_matured_horizon = (evaluation_date >= expected_maturity_date and evaluation_date <= REVIEW_AS_OF_DATE)
 
         for c in candidates:
             tid = c["topic_id"]
@@ -72,14 +75,22 @@ class PointInTimeBacktestEngine:
                     sub_cutoff = df_hist[df_hist["as_of_dt"] <= cutoff_dt]
                     sub_eval = df_hist[df_hist["as_of_dt"] <= eval_dt]
 
-                    val_cutoff = sub_cutoff["papers_count"].iloc[-1] if not sub_cutoff.empty else 100
-                    val_eval = sub_eval["papers_count"].iloc[-1] if not sub_eval.empty else val_cutoff
-                    growth_actual = float(val_eval / max(val_cutoff, 1))
-
-                    if growth_actual >= 1.9:
-                        outcome = GroundTruthOutcome.SUCCESS
+                    # 彻底消除默认值 100 回退：若缺失任一时点真实文献指标，判定为证据不足
+                    if sub_cutoff.empty or sub_eval.empty:
+                        outcome = GroundTruthOutcome.INSUFFICIENT_EVIDENCE
+                        growth_actual = None
                     else:
-                        outcome = GroundTruthOutcome.FAILURE
+                        val_cutoff = float(sub_cutoff["papers_count"].iloc[-1])
+                        val_eval = float(sub_eval["papers_count"].iloc[-1])
+                        if val_cutoff <= 0:
+                            outcome = GroundTruthOutcome.INSUFFICIENT_EVIDENCE
+                            growth_actual = None
+                        else:
+                            growth_actual = float(val_eval / val_cutoff)
+                            if growth_actual >= 1.9:
+                                outcome = GroundTruthOutcome.SUCCESS
+                            else:
+                                outcome = GroundTruthOutcome.FAILURE
                 else:
                     # 缺乏客观历史验证数据，严禁误判为失败，标记为证据不足
                     outcome = GroundTruthOutcome.INSUFFICIENT_EVIDENCE

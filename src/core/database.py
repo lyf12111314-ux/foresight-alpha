@@ -176,14 +176,17 @@ class DatabaseManager:
                     company_name VARCHAR NOT NULL,
                     industry_sector VARCHAR NOT NULL,
                     duration_months DOUBLE NOT NULL,
+                    observation_window_months DOUBLE,
                     is_distressed INTEGER NOT NULL,
                     distress_type VARCHAR NOT NULL,
+                    distress_event_type VARCHAR,
                     event_date DATE,
                     published_at TIMESTAMP NOT NULL,
-                    cash_burn_months DOUBLE NOT NULL,
+                    cash_burn_months DOUBLE,
                     debt_ratio DOUBLE NOT NULL,
                     gross_margin DOUBLE NOT NULL,
-                    competitor_count DOUBLE NOT NULL,
+                    competitor_count DOUBLE,
+                    is_covariate_audited BOOLEAN DEFAULT TRUE,
                     official_announcement_id VARCHAR,
                     source_url VARCHAR,
                     quality_status VARCHAR NOT NULL
@@ -197,6 +200,8 @@ class DatabaseManager:
                     topic_id VARCHAR NOT NULL,
                     base_date DATE NOT NULL,
                     published_at TIMESTAMP NOT NULL,
+                    feature_published_at TIMESTAMP,
+                    feature_ingested_at TIMESTAMP,
                     velocity_1y DOUBLE NOT NULL,
                     acceleration DOUBLE NOT NULL,
                     active_institutions DOUBLE NOT NULL,
@@ -204,14 +209,79 @@ class DatabaseManager:
                     macro_multiplier DOUBLE NOT NULL,
                     entropy_score DOUBLE NOT NULL,
                     novelty_score DOUBLE NOT NULL,
-                    target_1y DOUBLE NOT NULL,
-                    target_3y DOUBLE NOT NULL,
-                    target_5y DOUBLE NOT NULL,
+                    label_1y_period_end DATE,
+                    label_1y_status VARCHAR,
+                    target_1y DOUBLE,
+                    label_3y_period_end DATE,
+                    label_3y_status VARCHAR,
+                    target_3y DOUBLE,
+                    label_5y_period_end DATE,
+                    label_5y_status VARCHAR,
+                    target_5y DOUBLE,
                     quality_status VARCHAR NOT NULL
                 );
             """)
+
+            # 执行模式幂等升级与迁移
+            self.migrate_schema(conn)
         finally:
             conn.close()
+
+    def migrate_schema(self, conn=None):
+        """执行数据库模式幂等迁移，修复旧版本 NOT NULL 约束并增补审计字段"""
+        close_conn = False
+        if conn is None:
+            conn = self.get_connection()
+            close_conn = True
+        try:
+            # 1. 迁移 tech_training_samples：去除 target 字段的 NOT NULL 约束，允许未成熟标签为 NULL
+            for tgt_col in ["target_1y", "target_3y", "target_5y"]:
+                try:
+                    conn.execute(f"ALTER TABLE tech_training_samples ALTER COLUMN {tgt_col} DROP NOT NULL;")
+                except Exception:
+                    pass
+
+            for col, dtype in [
+                ("feature_published_at", "TIMESTAMP"),
+                ("feature_ingested_at", "TIMESTAMP"),
+                ("label_1y_period_end", "DATE"),
+                ("label_1y_status", "VARCHAR"),
+                ("label_3y_period_end", "DATE"),
+                ("label_3y_status", "VARCHAR"),
+                ("label_5y_period_end", "DATE"),
+                ("label_5y_status", "VARCHAR"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE tech_training_samples ADD COLUMN IF NOT EXISTS {col} {dtype};")
+                except Exception:
+                    pass
+
+            # 2. 迁移 company_distress_cohort：允许未核验协变量为 NULL 并补充事件类型
+            for cov_col in ["cash_burn_months", "competitor_count"]:
+                try:
+                    conn.execute(f"ALTER TABLE company_distress_cohort ALTER COLUMN {cov_col} DROP NOT NULL;")
+                except Exception:
+                    pass
+
+            for col, dtype in [
+                ("observation_window_months", "DOUBLE"),
+                ("distress_event_type", "VARCHAR"),
+                ("is_covariate_audited", "BOOLEAN DEFAULT TRUE"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE company_distress_cohort ADD COLUMN IF NOT EXISTS {col} {dtype};")
+                except Exception:
+                    pass
+
+            # 3. 迁移 model_forecasts 字段
+            try:
+                conn.execute("ALTER TABLE model_forecasts ADD COLUMN IF NOT EXISTS prediction_status VARCHAR DEFAULT 'UNVERIFIED_RESEARCH';")
+                conn.execute("ALTER TABLE model_forecasts ADD COLUMN IF NOT EXISTS is_verified_forecast BOOLEAN DEFAULT FALSE;")
+            except Exception:
+                pass
+        finally:
+            if close_conn:
+                conn.close()
 
     def query_df(self, sql: str, params: Optional[List[Any]] = None) -> pd.DataFrame:
         """执行 SQL 查询并返回 Pandas DataFrame"""

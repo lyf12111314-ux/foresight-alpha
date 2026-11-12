@@ -75,6 +75,17 @@ class DistressEventType(str, Enum):
     CENSORED_ACTIVE = "CENSORED_ACTIVE"                             # 正常存续/右删失 (未发生终结性违约事件)
 
 
+class OOSValidationRecord(BaseModel):
+    """样本外跨周期验证评估记录"""
+    metric_name: str
+    metric_value: float
+    threshold: float
+    passed: bool
+    evaluation_date: date
+    test_sample_count: int
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ModelVerificationInfo(BaseModel):
     """模型多维验证状态 (明确分离四种不同状态，禁止用单一 TRAINED 混淆)"""
     stage: ModelStage = ModelStage.UNTRAINED
@@ -85,6 +96,7 @@ class ModelVerificationInfo(BaseModel):
     dataset_version: Optional[str] = None
     model_version: str = "v1.1-p0"
     rejection_reason: Optional[str] = None
+    oos_validation: Optional[OOSValidationRecord] = None
 
 
 class DualTimeSampleMetadata(BaseModel):

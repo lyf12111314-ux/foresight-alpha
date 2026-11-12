@@ -42,20 +42,22 @@ class ResearchDossierGenerator:
         # 动态捕获时间 (拒绝硬编码 2018年第四季度)
         first_detected = candidate_info.get("first_detected_date") or evidence.get("first_detected_date") or "尚无可靠数据"
 
-        # 宏观环境动态表述 (拒绝硬编码康德拉季耶夫第六长波繁荣期)
+        # 宏观环境动态表述 (高斯混合 GMM-Regime 聚类模型口径)
         macro_regime = candidate_info.get("macro_regime")
         macro_multiplier = candidate_info.get("macro_growth_multiplier")
         if macro_regime:
-            macro_text = f"宏观周期高斯隐马尔可夫模型判定当前处于 **{macro_regime}** 阶段，宏观成长乘数为 `{macro_multiplier}`。"
+            macro_text = f"高斯混合宏观周期聚类模型 (GMM-Regime) 判定当前处于 **{macro_regime}** 阶段，宏观成长乘数为 `{macro_multiplier}`。"
         else:
             macro_text = "宏观周期长波匹配度处于定量模型动态测算中（尚无可靠数据支撑断言处于特定长波繁荣期）。"
+
+        verified_cov = candidate_info.get("verified_data_coverage_pct", data_cov if is_verified else 0.0)
 
         report_md = f"""# 【Foresight Alpha 深度研报】{topic_name}（{topic_id}）
 
 > **报告发布日期**：{now_str}  
 > **数据审计截止**：{candidate_info.get('as_of_data_date', date.today().isoformat())}  
 > **模型版本**：ForesightAlpha-Synthesizer v1.1.0  
-> **研究综合评分**：`{score} / 100` ｜ **数据覆盖度**：`{data_cov}%` ｜ **预测校准状态**：`{pred_status}`  
+> **研究综合评分**：`{score} / 100` ｜ **模块分析覆盖度**：`{data_cov}%`（经真实验证数据覆盖度：`{verified_cov}%`） ｜ **预测校准状态**：`{pred_status}`  
 > **经校准成功概率**：`{prob_str}` ｜ **评级**：`{rating}`  
 > **免责声明**：本报告为宏观与产业量化模型辅助决策成果，不构成确定性投资收益承诺。
 
@@ -72,7 +74,7 @@ class ResearchDossierGenerator:
   3. 头部产业资本由纯财务投资转向产线落地实测验证。
 
 ## 3. 宏观环境与周期匹配度
-根据高斯隐马尔可夫模型 (Gaussian HMM) 与宏观多周期分解：
+根据高斯混合宏观周期聚类模型 (GMM-Regime) 与宏观多周期分解：
 - 当前中国宏观经济正处于结构转型与动能转换期，全要素生产率提质增效诉求强烈；
 - {macro_text}
 
@@ -107,7 +109,7 @@ class ResearchDossierGenerator:
 - **当前扩散渗透率**：`{penetration}%`（处于 {stage_desc}）；
 """
         if growth_3y is not None:
-            report_md += f"""- **未来 3 年产业复合增长预期**：`{growth_3y} 倍`（80% 置信区间：`[{round(growth_3y*0.82, 1)}x, {round(growth_3y*1.28, 1)}x]`）；
+            report_md += f"""- **未来 3 年产业复合增长预期**：`{growth_3y} 倍`（定性情景区间假设：`[{round(growth_3y*0.82, 1)}x, {round(growth_3y*1.28, 1)}x]`，基于行业历史经验参考范围，非统计置信区间）；
 - **未来 5 年产业空间推演**：预计跨越 20% 主流采纳临界点。
 """
         else:
@@ -119,9 +121,9 @@ class ResearchDossierGenerator:
 ## 10. 不同情景下的发展路径推演
 """
         if growth_3y is not None:
-            report_md += f"""- **保守情景 (Bear Case, 概率 20%)**：下游验证进度迟缓，三年增长倍数收敛至 `{round(growth_3y * 0.70, 2)}x`；
-- **基准情景 (Base Case, 概率 60%)**：按照当前技术扩散速度平稳推进，三年增长倍数达到 `{growth_3y}x`；
-- **乐观情景 (Bull Case, 概率 20%)**：出现爆款商业应用，三年非线性增长达 `{round(growth_3y * 1.35, 2)}x`。
+            report_md += f"""- **保守情景 (Bear Case, 定性权重假设 20%)**：下游验证进度迟缓，三年增长倍数收敛至 `{round(growth_3y * 0.70, 2)}x`；
+- **基准情景 (Base Case, 定性权重假设 60%)**：按照当前技术扩散速度平稳推进，三年增长倍数达到 `{growth_3y}x`；
+- **乐观情景 (Bull Case, 定性权重假设 20%)**：出现爆款商业应用，三年非线性增长达 `{round(growth_3y * 1.35, 2)}x`。
 """
         else:
             report_md += "- **情景推演状态**：当前为定性观察阶段，待真实训练样本达标后自动化生成量化情景推演。\n"
@@ -174,10 +176,10 @@ class ResearchDossierGenerator:
 - **宏观数据源**：世界银行官方开放数据库 (World Bank API) 与 国家统计局官方月度公报
 - **企业披露源**：巨潮资讯网上市公司经审计年报与交易所公开公告
 """
-        # 使用真正标准 SHA-256 计算数字签名
+        # 使用真正标准 SHA-256 计算数字签名 (本研报正文摘要哈希，非法定或区块链存证)
         sign_payload = f"{topic_id}:{candidate_info.get('as_of_data_date', '')}:{score}:{now_str}"
         real_sha256 = hashlib.sha256(sign_payload.encode('utf-8')).hexdigest()
-        report_md += f"""- **数据不可篡改签名**：`SHA256-{real_sha256}`
+        report_md += f"""- **研报正文摘要哈希签名**：`SHA256-{real_sha256}`（仅用于校验本研报内容完整性，非区块链或法定公证存证）
 
 ---
 *报告生成引擎：Foresight Alpha Research Engine V1.1 (P0 Trust Remediation)*

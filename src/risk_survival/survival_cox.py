@@ -10,6 +10,7 @@
 
 import numpy as np
 import pandas as pd
+from datetime import date
 from typing import Dict, Any, List, Optional
 from lifelines import KaplanMeierFitter, CoxPHFitter
 from src.core.types import (
@@ -17,7 +18,8 @@ from src.core.types import (
     ModelStage,
     DataQualityStatus,
     DistressEventType,
-    ModelVerificationInfo
+    ModelVerificationInfo,
+    OOSValidationRecord
 )
 
 
@@ -51,6 +53,7 @@ class CompanySurvivalEngine:
         self.model_version: str = "v1.1-p0-cox"
         self.dataset_version: Optional[str] = None
         self.rejection_reason: Optional[str] = None
+        self.oos_validation: Optional[OOSValidationRecord] = None
 
     def get_verification_info(self) -> ModelVerificationInfo:
         """获取当前模型的多维验证状态详情"""
@@ -62,8 +65,20 @@ class CompanySurvivalEngine:
             is_calibrated=self.is_calibrated,
             dataset_version=self.dataset_version,
             model_version=self.model_version,
-            rejection_reason=self.rejection_reason
+            rejection_reason=self.rejection_reason,
+            oos_validation=self.oos_validation
         )
+
+    def _reset_to_untrained(self, reason: str):
+        """重置生存分析模型状态，清空拟合标志并记录拒绝原因"""
+        self.is_fitted = False
+        self.is_algorithm_fitted = False
+        self.is_data_verified = False
+        self.is_out_of_sample_validated = False
+        self.oos_validation = None
+        self.training_status = ModelTrainingStatus.INSUFFICIENT_DATA
+        self.model_stage = ModelStage.UNTRAINED
+        self.rejection_reason = reason
 
     def fit_verified(
         self,
@@ -71,62 +86,57 @@ class CompanySurvivalEngine:
         duration_col: str = "duration",
         event_col: str = "event",
         quality_status: DataQualityStatus = DataQualityStatus.UNVERIFIED,
+        provenance_records: Optional[List[Any]] = None,
         dataset_version: str = "v1.1-cohort-verified"
     ) -> Dict[str, Any]:
-        """正式训练接口：仅接受经过审计核实的真实 VERIFIED 企业生存事件队列"""
+        """正式训练接口：仅接受经过审计核实的真实 VERIFIED 企业生存事件队列及血缘证明"""
         self.is_synthetic = False
 
         self.sample_count = len(cohort_df) if cohort_df is not None else 0
         if cohort_df is None or self.sample_count < self.MIN_TOTAL_SAMPLES:
-            self.training_status = ModelTrainingStatus.INSUFFICIENT_DATA
-            self.model_stage = ModelStage.UNTRAINED
-            self.rejection_reason = f"真实验证企业生存样本不足 ({self.sample_count} < {self.MIN_TOTAL_SAMPLES})，模型保持未训练状态。"
+            reason = f"真实验证企业生存样本不足 ({self.sample_count} < {self.MIN_TOTAL_SAMPLES})，模型保持未训练状态。"
+            self._reset_to_untrained(reason)
             return {
                 "status": ModelTrainingStatus.INSUFFICIENT_DATA.value,
                 "model_stage": self.model_stage.value,
                 "is_verified": False,
                 "sample_count": self.sample_count,
                 "min_required": self.MIN_TOTAL_SAMPLES,
-                "message": self.rejection_reason
+                "message": reason
             }
 
         if duration_col not in cohort_df.columns or event_col not in cohort_df.columns:
-            self.training_status = ModelTrainingStatus.INSUFFICIENT_DATA
-            self.model_stage = ModelStage.UNTRAINED
-            self.rejection_reason = f"队列数据缺少必要列 [{duration_col}, {event_col}]。"
+            reason = f"队列数据缺少必要列 [{duration_col}, {event_col}]。"
+            self._reset_to_untrained(reason)
             return {
                 "status": ModelTrainingStatus.INSUFFICIENT_DATA.value,
                 "model_stage": self.model_stage.value,
                 "is_verified": False,
-                "message": self.rejection_reason
+                "message": reason
             }
 
         events_observed = int(cohort_df[event_col].sum())
         self.event_count = events_observed
 
         if events_observed < self.MIN_EVENTS_REQUIRED:
-            self.training_status = ModelTrainingStatus.INSUFFICIENT_DATA
-            self.model_stage = ModelStage.UNTRAINED
-            self.rejection_reason = f"破产/重整真实事件数不足 ({events_observed} < {self.MIN_EVENTS_REQUIRED})，无法可靠估计 Cox 协变量系数。"
+            reason = f"破产/重整真实事件数不足 ({events_observed} < {self.MIN_EVENTS_REQUIRED})，无法可靠估计 Cox 协变量系数。"
+            self._reset_to_untrained(reason)
             return {
                 "status": ModelTrainingStatus.INSUFFICIENT_DATA.value,
                 "model_stage": self.model_stage.value,
                 "is_verified": False,
                 "events_observed": events_observed,
                 "min_events_required": self.MIN_EVENTS_REQUIRED,
-                "message": self.rejection_reason
+                "message": reason
             }
 
         # 1. 强制数据质量状态审计门禁
         if quality_status != DataQualityStatus.VERIFIED:
-            self.training_status = ModelTrainingStatus.INSUFFICIENT_DATA
-            self.model_stage = ModelStage.UNTRAINED
-            self.is_data_verified = False
-            self.is_algorithm_fitted = False
-            self.rejection_reason = (
+            reason = (
                 f"正式生存模型准入门禁拒绝：队列数据质量状态为 {quality_status.value if hasattr(quality_status, 'value') else quality_status}，"
                 f"非 VERIFIED 审计通过状态。MANUAL_REFERENCE 仅允许通过 fit_experimental 运行算法研究模式。"
             )
+            self._reset_to_untrained(reason)
             return {
                 "status": ModelTrainingStatus.INSUFFICIENT_DATA.value,
                 "model_stage": self.model_stage.value,
@@ -134,9 +144,36 @@ class CompanySurvivalEngine:
                 "sample_count": self.sample_count,
                 "events_observed": self.event_count,
                 "min_events_required": self.MIN_EVENTS_REQUIRED,
-                "rejection_reason": self.rejection_reason,
-                "message": self.rejection_reason
+                "rejection_reason": reason,
+                "message": reason
             }
+
+        # 2. 强制真实数据血缘与有效核验记录验证
+        if not provenance_records or len(provenance_records) < self.sample_count:
+            reason = "正式生存模型准入门禁拒绝：未提供经核验的企业生存数据血缘记录 (provenance_records) 或血缘样本数量不足。"
+            self._reset_to_untrained(reason)
+            return {
+                "status": ModelTrainingStatus.INSUFFICIENT_DATA.value,
+                "model_stage": self.model_stage.value,
+                "is_verified": False,
+                "sample_count": self.sample_count,
+                "rejection_reason": reason,
+                "message": reason
+            }
+
+        for idx, prov in enumerate(provenance_records):
+            p_status = getattr(prov, "quality_status", None) or (prov.get("quality_status") if isinstance(prov, dict) else None)
+            p_hash = getattr(prov, "raw_hash", None) or (prov.get("raw_hash") if isinstance(prov, dict) else None)
+            if p_status not in [DataQualityStatus.VERIFIED, DataQualityStatus.VERIFIED.value, "VERIFIED"] or not p_hash:
+                reason = f"正式生存模型准入门禁拒绝：血缘记录 #{idx} 质量状态非 VERIFIED 或缺失不可篡改哈希签名。"
+                self._reset_to_untrained(reason)
+                return {
+                    "status": ModelTrainingStatus.INSUFFICIENT_DATA.value,
+                    "model_stage": self.model_stage.value,
+                    "is_verified": False,
+                    "rejection_reason": reason,
+                    "message": reason
+                }
 
         try:
             self.kmf.fit(durations=cohort_df[duration_col], event_observed=cohort_df[event_col], label="真实验证企业队列")
@@ -144,20 +181,109 @@ class CompanySurvivalEngine:
             self.is_fitted = True
             self.is_algorithm_fitted = True
             self.is_data_verified = True
-            self.model_stage = ModelStage.VERIFIED_PRODUCTION
+            self.is_out_of_sample_validated = False
+            self.model_stage = ModelStage.BENCHMARK
             self.training_status = ModelTrainingStatus.TRAINED
             self.dataset_version = dataset_version
             self.rejection_reason = None
             return {
                 "status": ModelTrainingStatus.TRAINED.value,
                 "model_stage": self.model_stage.value,
-                "is_verified": True,
+                "is_verified": False,
+                "is_algorithm_fitted": True,
                 "sample_count": self.sample_count,
                 "events_observed": self.event_count,
                 "dataset_version": self.dataset_version,
-                "message": "已基于逐项审计的真实企业生存事件队列完成正式拟合。"
+                "message": "已基于逐项审计的真实企业生存事件队列完成基准拟合，待样本外跨周期检验 (OOS) 后可晋升为生产模型。"
             }
         except Exception as e:
+            self._reset_to_untrained(str(e))
+            return {
+                "status": ModelTrainingStatus.INSUFFICIENT_DATA.value,
+                "model_stage": self.model_stage.value,
+                "is_verified": False,
+                "error": str(e)
+            }
+
+    def validate_out_of_sample(
+        self,
+        oos_cohort_df: pd.DataFrame,
+        duration_col: str = "duration",
+        event_col: str = "event",
+        min_c_index: float = 0.55,
+        evaluation_date: Optional[date] = None
+    ) -> Dict[str, Any]:
+        """样本外跨周期生存分析验证门禁 (OOS Concordance Index Validation).
+        
+        要求独立样本外队列的 C-index >= min_c_index (默认 0.55)，方允许晋升为正式生产模型。
+        """
+        if not self.is_algorithm_fitted or not self.is_data_verified or not self.is_fitted:
+            return {
+                "status": "VALIDATION_FAILED",
+                "model_stage": self.model_stage.value,
+                "passed": False,
+                "message": "生存模型尚未完成真实验证基准拟合，无法执行样本外检验。"
+            }
+
+        if oos_cohort_df is None or len(oos_cohort_df) == 0:
+            return {
+                "status": "VALIDATION_FAILED",
+                "model_stage": self.model_stage.value,
+                "passed": False,
+                "message": "未提供有效的样本外测试队列。"
+            }
+
+        if duration_col not in oos_cohort_df.columns or event_col not in oos_cohort_df.columns:
+            return {
+                "status": "VALIDATION_FAILED",
+                "model_stage": self.model_stage.value,
+                "passed": False,
+                "message": f"测试队列缺少必要字段 [{duration_col}, {event_col}]。"
+            }
+
+        from lifelines.utils import concordance_index
+        risk_scores = self.cph.predict_partial_hazard(oos_cohort_df)
+        c_val = float(concordance_index(
+            event_times=oos_cohort_df[duration_col],
+            predicted_scores=-risk_scores,
+            event_observed=oos_cohort_df[event_col]
+        ))
+        c_val = round(c_val, 4)
+        passed = bool(c_val >= min_c_index)
+
+        rec = OOSValidationRecord(
+            metric_name="Concordance_Index",
+            metric_value=c_val,
+            threshold=min_c_index,
+            passed=passed,
+            evaluation_date=evaluation_date or date.today(),
+            test_sample_count=len(oos_cohort_df),
+            details={"c_index": c_val, "min_required": min_c_index}
+        )
+        self.oos_validation = rec
+
+        if passed:
+            self.is_out_of_sample_validated = True
+            self.model_stage = ModelStage.VERIFIED_PRODUCTION
+            return {
+                "status": "PROMOTED_TO_PRODUCTION",
+                "model_stage": self.model_stage.value,
+                "passed": True,
+                "c_index": c_val,
+                "min_required": min_c_index,
+                "message": f"样本外跨周期生存验证通过 (C-index: {c_val} >= {min_c_index})，模型晋升为正式生产验证状态。"
+            }
+        else:
+            self.is_out_of_sample_validated = False
+            self.model_stage = ModelStage.BENCHMARK
+            return {
+                "status": "OOS_VALIDATION_FAILED",
+                "model_stage": self.model_stage.value,
+                "passed": False,
+                "c_index": c_val,
+                "min_required": min_c_index,
+                "message": f"样本外跨周期生存验证未达标 (C-index: {c_val} < {min_c_index})，保持基准模型状态，禁止用于正式预测。"
+            }
             self.training_status = ModelTrainingStatus.INSUFFICIENT_DATA
             self.model_stage = ModelStage.UNTRAINED
             self.rejection_reason = str(e)
@@ -306,12 +432,31 @@ class CompanySurvivalEngine:
 
         surv_func = self.cph.predict_survival_function(sample_df)
 
-        times = [1.0, 3.0, 5.0]
+        # P0-04: 同步时间单位至月份 (1年=12月, 3年=36月, 5年=60月)，阶梯函数右连续估值与右截尾保护
+        min_observed_dur = float(surv_func.index.min()) if not surv_func.empty else 0.0
+        max_observed_dur = float(surv_func.index.max()) if not surv_func.empty else 0.0
+        is_in_months = (max_observed_dur > 15.0)
+        time_unit = "MONTHS" if is_in_months else "YEARS"
+
+        horizon_months = {"surv_1y": 12.0, "surv_3y": 36.0, "surv_5y": 60.0}
         survival_probs = {}
-        for t in times:
-            closest_idx = np.argmin(np.abs(surv_func.index - t))
-            p_surv = float(surv_func.iloc[closest_idx, 0])
-            survival_probs[f"surv_{int(t)}y"] = round(p_surv, 3)
+
+        for key, t_months in horizon_months.items():
+            t_eval = t_months if is_in_months else (t_months / 12.0)
+            if t_eval < min_observed_dur:
+                # 在首次违约/破产事件发生前，全队列存活概率为 1.0 (右连续阶梯函数初始平台)
+                survival_probs[key] = 1.0
+            elif t_eval > max_observed_dur:
+                # 超过队列最大跟踪观察期，右截尾样本不支持不可信外推，置为 None
+                survival_probs[key] = None
+            else:
+                # 阶梯函数：取满足 event_time <= t 的最后一个生存概率点
+                eligible = surv_func.index[surv_func.index <= t_eval]
+                if len(eligible) > 0:
+                    p_surv = float(surv_func.loc[eligible[-1]].iloc[0])
+                    survival_probs[key] = round(p_surv, 3)
+                else:
+                    survival_probs[key] = 1.0
 
         partial_hazard = float(self.cph.predict_partial_hazard(sample_df).iloc[0])
 
@@ -326,7 +471,12 @@ class CompanySurvivalEngine:
             assessment = "具备深厚毛利护城河与充裕现金安全垫，能够穿越产业出清周期。"
 
         hazard_ratios = {col: round(float(np.exp(coef)), 3) for col, coef in self.cph.params_.items()}
-        is_verified = (self.model_stage == ModelStage.VERIFIED_PRODUCTION and self.is_data_verified and not self.is_synthetic)
+        is_verified = (
+            self.model_stage == ModelStage.VERIFIED_PRODUCTION
+            and self.is_data_verified
+            and self.is_out_of_sample_validated
+            and not self.is_synthetic
+        )
         status_str = "PREDICTED" if is_verified else "UNVERIFIED_RESEARCH"
 
         return {
@@ -338,6 +488,8 @@ class CompanySurvivalEngine:
             "model_version": self.model_version,
             "partial_hazard_ratio": round(partial_hazard, 2),
             "risk_tier": risk_tier,
+            "time_unit": "MONTHS",
+            "horizon_months": horizon_months,
             "survival_probabilities": survival_probs,
             "risk_assessment": assessment,
             "hazard_factor_multipliers": hazard_ratios,

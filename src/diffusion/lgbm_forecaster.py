@@ -11,8 +11,9 @@
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+from datetime import date
 from typing import Dict, Any, List, Tuple, Optional
-from src.core.types import ModelTrainingStatus, ModelStage, DataQualityStatus, ModelVerificationInfo
+from src.core.types import ModelTrainingStatus, ModelStage, DataQualityStatus, ModelVerificationInfo, OOSValidationRecord
 
 
 class LightGBMGrowthForecaster:
@@ -44,6 +45,7 @@ class LightGBMGrowthForecaster:
         self.model_version: str = "v1.1-p0-lgbm"
         self.dataset_version: Optional[str] = None
         self.rejection_reason: Optional[str] = None
+        self.oos_validation: Optional[OOSValidationRecord] = None
 
     def get_verification_info(self) -> ModelVerificationInfo:
         """获取当前模型的多维验证状态详情"""
@@ -55,66 +57,109 @@ class LightGBMGrowthForecaster:
             is_calibrated=self.is_calibrated,
             dataset_version=self.dataset_version,
             model_version=self.model_version,
-            rejection_reason=self.rejection_reason
+            rejection_reason=self.rejection_reason,
+            oos_validation=self.oos_validation
         )
+
+    def _reset_to_untrained(self, reason: str):
+        """彻底清空模型与状态缓存，防止历史权重残留"""
+        self.models.clear()
+        self.training_status = ModelTrainingStatus.MODEL_NOT_TRAINED
+        self.model_stage = ModelStage.UNTRAINED
+        self.is_algorithm_fitted = False
+        self.is_data_verified = False
+        self.is_out_of_sample_validated = False
+        self.oos_validation = None
+        self.rejection_reason = reason
 
     def fit_verified(
         self,
         features: Optional[Any] = None,
         labels_by_horizon: Optional[Dict[int, Any]] = None,
         quality_status: DataQualityStatus = DataQualityStatus.UNVERIFIED,
+        provenance_records: Optional[List[Any]] = None,
         dataset_version: str = "v1.1-verified"
     ) -> Dict[str, Any]:
-        """正式训练准入接口：仅接受经过逐项审计与证明的真实 VERIFIED 数据集"""
+        """正式训练准入接口：仅接受经过逐项审计与证明的真实 VERIFIED 数据集及血缘证明"""
         self.is_synthetic = False
 
         # 1. 强制数据质量状态审计门禁 (禁止凭普通数组、MANUAL_REFERENCE、SYNTHETIC 或 UNVERIFIED 启动正式训练)
         self.sample_count = len(features) if features is not None else 0
         if features is None or self.sample_count < self.MIN_REAL_TRAINING_SAMPLES:
-            self.training_status = ModelTrainingStatus.MODEL_NOT_TRAINED
-            self.model_stage = ModelStage.UNTRAINED
-            self.is_data_verified = False
-            self.rejection_reason = f"真实验证训练样本不足 ({self.sample_count} < {self.MIN_REAL_TRAINING_SAMPLES})，模型保持未训练状态。"
+            reason = f"真实验证训练样本不足 ({self.sample_count} < {self.MIN_REAL_TRAINING_SAMPLES})，模型保持未训练状态。"
+            self._reset_to_untrained(reason)
             return {
                 "status": ModelTrainingStatus.MODEL_NOT_TRAINED.value,
                 "model_stage": self.model_stage.value,
                 "is_verified": False,
                 "sample_count": self.sample_count,
                 "min_required": self.MIN_REAL_TRAINING_SAMPLES,
-                "message": self.rejection_reason
+                "message": reason
             }
 
-        # 1. 强制数据质量状态审计门禁 (禁止凭普通数组、MANUAL_REFERENCE、SYNTHETIC 或 UNVERIFIED 启动正式训练)
         if quality_status != DataQualityStatus.VERIFIED:
-            self.training_status = ModelTrainingStatus.MODEL_NOT_TRAINED
-            self.model_stage = ModelStage.UNTRAINED
-            self.is_data_verified = False
-            self.is_algorithm_fitted = False
-            self.rejection_reason = (
+            reason = (
                 f"正式训练准入门禁拒绝：数据质量状态为 {quality_status.value if hasattr(quality_status, 'value') else quality_status}，"
                 f"非 VERIFIED 审计通过状态。MANUAL_REFERENCE 仅允许通过 fit_experimental 运行研究实验模式。"
             )
+            self._reset_to_untrained(reason)
             return {
                 "status": ModelTrainingStatus.MODEL_NOT_TRAINED.value,
                 "model_stage": self.model_stage.value,
                 "is_verified": False,
                 "sample_count": self.sample_count,
                 "min_required": self.MIN_REAL_TRAINING_SAMPLES,
-                "rejection_reason": self.rejection_reason,
-                "message": self.rejection_reason
+                "rejection_reason": reason,
+                "message": reason
             }
 
-        # 检查每个期限的标签成熟度与完整性
-        for horizon in [1, 3, 5]:
-            if horizon not in labels_by_horizon or len(labels_by_horizon[horizon]) != len(features):
-                self.training_status = ModelTrainingStatus.MODEL_NOT_TRAINED
-                self.model_stage = ModelStage.UNTRAINED
-                self.rejection_reason = f"缺少 {horizon} 年期的有效真实标签数据。"
+        # 2. 强制真实数据血缘与有效核验记录验证 (严禁仅传 VERIFIED 却无核验血缘凭证)
+        if not provenance_records or len(provenance_records) < self.sample_count:
+            reason = "正式训练准入门禁拒绝：未提供经核验的数据血缘记录 (provenance_records) 或血缘样本数量不足。"
+            self._reset_to_untrained(reason)
+            return {
+                "status": ModelTrainingStatus.MODEL_NOT_TRAINED.value,
+                "model_stage": self.model_stage.value,
+                "is_verified": False,
+                "sample_count": self.sample_count,
+                "rejection_reason": reason,
+                "message": reason
+            }
+
+        for idx, prov in enumerate(provenance_records):
+            p_status = getattr(prov, "quality_status", None) or (prov.get("quality_status") if isinstance(prov, dict) else None)
+            p_hash = getattr(prov, "raw_hash", None) or (prov.get("raw_hash") if isinstance(prov, dict) else None)
+            if p_status not in [DataQualityStatus.VERIFIED, DataQualityStatus.VERIFIED.value, "VERIFIED"] or not p_hash:
+                reason = f"正式训练准入门禁拒绝：血缘记录 #{idx} 质量状态非 VERIFIED 或缺失不可篡改哈希签名。"
+                self._reset_to_untrained(reason)
                 return {
                     "status": ModelTrainingStatus.MODEL_NOT_TRAINED.value,
                     "model_stage": self.model_stage.value,
                     "is_verified": False,
-                    "message": self.rejection_reason
+                    "rejection_reason": reason,
+                    "message": reason
+                }
+
+        # 3. 检查每个期限的标签成熟度与完整性
+        if not labels_by_horizon:
+            reason = "缺少多预测期限的标签数据字典。"
+            self._reset_to_untrained(reason)
+            return {
+                "status": ModelTrainingStatus.MODEL_NOT_TRAINED.value,
+                "model_stage": self.model_stage.value,
+                "is_verified": False,
+                "message": reason
+            }
+
+        for horizon in [1, 3, 5]:
+            if horizon not in labels_by_horizon or len(labels_by_horizon[horizon]) != len(features):
+                reason = f"缺少 {horizon} 年期的有效真实标签数据或长度不匹配。"
+                self._reset_to_untrained(reason)
+                return {
+                    "status": ModelTrainingStatus.MODEL_NOT_TRAINED.value,
+                    "model_stage": self.model_stage.value,
+                    "is_verified": False,
+                    "message": reason
                 }
 
             reg = lgb.LGBMRegressor(
@@ -128,10 +173,12 @@ class LightGBMGrowthForecaster:
             reg.fit(features, labels_by_horizon[horizon])
             self.models[horizon] = reg
 
+        # 拟合通过后进入 BENCHMARK 阶段，待样本外跨周期检验通过后方可晋升为 VERIFIED_PRODUCTION
         self.training_status = ModelTrainingStatus.TRAINED
-        self.model_stage = ModelStage.VERIFIED_PRODUCTION
+        self.model_stage = ModelStage.BENCHMARK
         self.is_algorithm_fitted = True
         self.is_data_verified = True
+        self.is_out_of_sample_validated = False
         self.is_synthetic = False
         self.sample_count = len(features)
         self.dataset_version = dataset_version
@@ -139,11 +186,98 @@ class LightGBMGrowthForecaster:
         return {
             "status": ModelTrainingStatus.TRAINED.value,
             "model_stage": self.model_stage.value,
-            "is_verified": True,
+            "is_verified": False,
+            "is_algorithm_fitted": True,
             "sample_count": self.sample_count,
             "dataset_version": self.dataset_version,
-            "message": "模型已使用逐项核验的真实验证数据集完成正式训练。"
+            "message": "模型已使用逐项核验的真实验证数据集完成基准训练，待样本外验证 (OOS) 后可晋升为正式生产模型。"
         }
+
+    def validate_out_of_sample(
+        self,
+        oos_features: Any,
+        oos_labels_by_horizon: Dict[int, Any],
+        max_allowed_mae: float = 3.0,
+        evaluation_date: Optional[date] = None
+    ) -> Dict[str, Any]:
+        """样本外跨周期检验门禁 (OOS Validation Gate).
+        
+        仅当模型基于 VERIFIED 数据完成基准训练，且在完全独立的跨周期测试集上评测 MAE 达标后，
+        方允许晋升为 VERIFIED_PRODUCTION 阶段。
+        """
+        if not self.is_algorithm_fitted or not self.is_data_verified or not self.models:
+            return {
+                "status": "VALIDATION_FAILED",
+                "model_stage": self.model_stage.value,
+                "passed": False,
+                "message": "模型尚未完成真实验证基准拟合，无法执行样本外检验。"
+            }
+
+        if oos_features is None or len(oos_features) == 0:
+            return {
+                "status": "VALIDATION_FAILED",
+                "model_stage": self.model_stage.value,
+                "passed": False,
+                "message": "未提供有效的样本外测试特征。"
+            }
+
+        X_test = oos_features.values if hasattr(oos_features, "values") else np.array(oos_features)
+        mae_by_horizon = {}
+        for horizon, model in self.models.items():
+            if horizon in oos_labels_by_horizon:
+                y_true = np.array(oos_labels_by_horizon[horizon])
+                valid_mask = pd.notna(y_true) & [y is not None for y in y_true]
+                if np.sum(valid_mask) > 0:
+                    y_pred = model.predict(X_test[valid_mask])
+                    mae = float(np.mean(np.abs(y_pred - y_true[valid_mask].astype(float))))
+                    mae_by_horizon[horizon] = round(mae, 3)
+
+        if not mae_by_horizon:
+            return {
+                "status": "VALIDATION_FAILED",
+                "model_stage": self.model_stage.value,
+                "passed": False,
+                "message": "样本外测试集中无有效成熟标签。"
+            }
+
+        max_mae = max(mae_by_horizon.values())
+        passed = bool(max_mae <= max_allowed_mae)
+
+        rec = OOSValidationRecord(
+            metric_name="Max_MAE",
+            metric_value=max_mae,
+            threshold=max_allowed_mae,
+            passed=passed,
+            evaluation_date=evaluation_date or date.today(),
+            test_sample_count=len(oos_features),
+            details={"mae_by_horizon": mae_by_horizon}
+        )
+        self.oos_validation = rec
+
+        if passed:
+            self.is_out_of_sample_validated = True
+            self.model_stage = ModelStage.VERIFIED_PRODUCTION
+            return {
+                "status": "PROMOTED_TO_PRODUCTION",
+                "model_stage": self.model_stage.value,
+                "passed": True,
+                "max_mae": max_mae,
+                "threshold": max_allowed_mae,
+                "details": mae_by_horizon,
+                "message": f"样本外跨周期检验通过 (Max MAE: {max_mae} <= {max_allowed_mae})，模型晋升为正式生产验证状态。"
+            }
+        else:
+            self.is_out_of_sample_validated = False
+            self.model_stage = ModelStage.BENCHMARK
+            return {
+                "status": "OOS_VALIDATION_FAILED",
+                "model_stage": self.model_stage.value,
+                "passed": False,
+                "max_mae": max_mae,
+                "threshold": max_allowed_mae,
+                "details": mae_by_horizon,
+                "message": f"样本外跨周期检验未达标 (Max MAE: {max_mae} > {max_allowed_mae})，保持基准模型状态，禁止用于正式预测。"
+            }
 
     def fit_experimental(
         self,
@@ -356,7 +490,12 @@ class LightGBMGrowthForecaster:
             tot_imp = sum(imp_3y) + 1e-6
             driver_importance = {name: round(float(imp / tot_imp), 3) for name, imp in zip(self.feature_names, imp_3y)}
 
-        is_verified = (self.model_stage == ModelStage.VERIFIED_PRODUCTION and self.is_data_verified and not self.is_synthetic)
+        is_verified = (
+            self.model_stage == ModelStage.VERIFIED_PRODUCTION
+            and self.is_data_verified
+            and self.is_out_of_sample_validated
+            and not self.is_synthetic
+        )
         status_str = "PREDICTED" if is_verified else "UNVERIFIED_RESEARCH"
 
         return {

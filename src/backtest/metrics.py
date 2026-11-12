@@ -44,22 +44,22 @@ class BacktestMetricsCalculator:
         true_labels: Dict[str, Any],
         k: int,
         filter_evaluable_only: bool = False
-    ) -> float:
-        """计算 Top-K 推荐预测精确率 Precision@K"""
+    ) -> Optional[float]:
+        """计算 Top-K 推荐预测精确率 Precision@K (杜绝后位填充 Cherry-picking)"""
         if not predicted_scores or k <= 0:
-            return 0.0
+            return None if filter_evaluable_only else 0.0
 
         sorted_preds = sorted(predicted_scores, key=lambda x: x[1], reverse=True)
+        top_k = sorted_preds[:k]
 
         if filter_evaluable_only:
-            # 仅在已成熟且有证据的样本中评估
-            evaluable_preds = [item for item in sorted_preds if cls._is_evaluable(true_labels.get(item[0]))][:k]
+            # 仅在 Top-K 内已成熟且有证据的样本中评估，禁止从 k 之后抽样顶替
+            evaluable_preds = [item for item in top_k if cls._is_evaluable(true_labels.get(item[0]))]
             if not evaluable_preds:
-                return 0.0
+                return None
             hits = sum(1 for item in evaluable_preds if cls._is_positive(true_labels.get(item[0])))
             return round(float(hits / len(evaluable_preds)), 3)
         else:
-            top_k = sorted_preds[:k]
             hits = sum(1 for item in top_k if cls._is_positive(true_labels.get(item[0])))
             return round(float(hits / k), 3)
 
@@ -69,10 +69,13 @@ class BacktestMetricsCalculator:
         predicted_scores: List[Tuple[str, float]],
         true_labels: Dict[str, Any],
         k: int
-    ) -> float:
+    ) -> Optional[float]:
         """计算 Top-K 推荐预测召回率 Recall@K"""
         tot_positives = sum(1 for v in true_labels.values() if cls._is_positive(v))
-        if tot_positives == 0 or not predicted_scores or k <= 0:
+        if tot_positives == 0:
+            # 无正样本事实时，召回率未定义，返回 None
+            return None
+        if not predicted_scores or k <= 0:
             return 0.0
 
         sorted_preds = sorted(predicted_scores, key=lambda x: x[1], reverse=True)[:k]
@@ -80,30 +83,58 @@ class BacktestMetricsCalculator:
         return round(float(hits / tot_positives), 3)
 
     @classmethod
+    def average_precision(
+        cls,
+        predicted_scores: List[Tuple[str, float]],
+        true_labels: Dict[str, Any]
+    ) -> Optional[float]:
+        """计算平均精度 Average Precision (AP = sum(P_k * delta_R_k))."""
+        if not predicted_scores or not true_labels:
+            return None
+
+        evaluable_items = [item for item in predicted_scores if cls._is_evaluable(true_labels.get(item[0]))]
+        if not evaluable_items:
+            return None
+
+        sorted_items = sorted(evaluable_items, key=lambda x: x[1], reverse=True)
+        total_positives = sum(1 for item in sorted_items if cls._is_positive(true_labels.get(item[0])))
+        if total_positives == 0:
+            return None
+
+        cumulative_hits = 0
+        precisions_at_hits = []
+        for rank, item in enumerate(sorted_items, start=1):
+            if cls._is_positive(true_labels.get(item[0])):
+                cumulative_hits += 1
+                precisions_at_hits.append(cumulative_hits / rank)
+
+        return round(float(np.mean(precisions_at_hits)), 3) if precisions_at_hits else 0.0
+
+    @classmethod
     def pr_auc(
         cls,
         predicted_scores: List[Tuple[str, float]],
         true_labels: Dict[str, Any]
-    ) -> float:
-        """真实计算 Precision-Recall 曲线下面积 (PR-AUC / Average Precision via Trapezoidal Integration).
+    ) -> Optional[float]:
+        """真实计算 Precision-Recall 曲线下面积 (PR-AUC 梯形数值积分).
         
         严禁使用 (Precision@3 + Precision@5) / 2 冒充 PR-AUC！
         基于按模型预测分值降序排列的所有割点 (k=1..N)，计算真实 (Recall, Precision) 梯形积分。
         """
         if not predicted_scores or not true_labels:
-            return 0.0
+            return None
 
         # 过滤可评估的样本
         evaluable_items = [item for item in predicted_scores if cls._is_evaluable(true_labels.get(item[0]))]
         if not evaluable_items:
-            return 0.0
+            return None
 
         # 按预测分降序排列
         sorted_items = sorted(evaluable_items, key=lambda x: x[1], reverse=True)
         total_positives = sum(1 for item in sorted_items if cls._is_positive(true_labels.get(item[0])))
 
         if total_positives == 0:
-            return 0.0
+            return None
 
         # 遍历各个 rank cutoff，计算各点的 (Recall, Precision)
         recalls = [0.0]
@@ -148,28 +179,29 @@ class BacktestMetricsCalculator:
         true_labels: Dict[str, Any],
         k: int = 3,
         momentum_key: str = "velocity_1y"
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Optional[float]]:
         """同候选池、同评价期动态测算随机基准与动量外推基准
         
         1. 随机基准 (Random Baseline)：
            在当前评估池中，随机抽取 k 个标的命中正样本的期望精确率 = (正样本总数 / 可评估候选总数)。
         2. 动量基准 (Momentum Baseline)：
-           按照过去真实公开的简单动量指标 (如 velocity_1y) 降序排列，取 Top-K 得到的真实精确率。
+           按照过去真实公开的简单历史动量指标 (如 velocity_1y) 降序排列，取 Top-K 得到的真实精确率。
+           严禁使用截止日之后的未来增长率 (如 growth_multiple_3y) 冒充历史动量！
         """
         evaluable_cands = [c for c in candidate_items if cls._is_evaluable(true_labels.get(c.get("topic_id")))]
         if not evaluable_cands:
-            return {"random_baseline_precision": 0.0, "momentum_baseline_precision": 0.0}
+            return {"random_baseline_precision": None, "momentum_baseline_precision": None}
 
         total_evaluable = len(evaluable_cands)
         total_positives = sum(1 for c in evaluable_cands if cls._is_positive(true_labels.get(c.get("topic_id"))))
 
         # 动态随机基准
-        random_prec = round(float(total_positives / total_evaluable), 3) if total_evaluable > 0 else 0.0
+        random_prec = round(float(total_positives / total_evaluable), 3) if total_evaluable > 0 else None
 
-        # 动态动量基准：按动量特征降序排列
+        # 动态动量基准：仅使用历史动量特征降序排列 (严禁未来信息泄漏)
         sorted_by_momentum = sorted(
             evaluable_cands,
-            key=lambda c: float(c.get(momentum_key, c.get("inflection_evidence", {}).get("growth_multiple_3y", 0.0)) or 0.0),
+            key=lambda c: float(c.get(momentum_key, 0.0) or 0.0),
             reverse=True
         )[:k]
 
@@ -187,17 +219,17 @@ class BacktestMetricsCalculator:
     @classmethod
     def calculate_excess_hit_rate(
         cls,
-        model_precision: float,
+        model_precision: Optional[float],
         random_baseline_precision: Optional[float] = None,
         momentum_baseline_precision: Optional[float] = None,
         candidate_items: Optional[List[Dict[str, Any]]] = None,
         true_labels: Optional[Dict[str, Any]] = None,
         k: int = 3
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Optional[float]]:
         """计算相对于动态随机基准与动量外推基准的超额胜率。
         
         若传入 candidate_items 与 true_labels，则自动进行动态计算；
-        否则若显式指定了 baseline 则直接使用，默认 fallback 回保底参考值。
+        若 model_precision 为 None 或无有效基准，则返回 None。
         """
         if candidate_items is not None and true_labels is not None:
             dyn = cls.calculate_dynamic_baselines(candidate_items, true_labels, k=k)
@@ -207,9 +239,12 @@ class BacktestMetricsCalculator:
             r_base = random_baseline_precision if random_baseline_precision is not None else 0.33
             m_base = momentum_baseline_precision if momentum_baseline_precision is not None else 0.45
 
+        excess_r = round(model_precision - r_base, 3) if (model_precision is not None and r_base is not None) else None
+        excess_m = round(model_precision - m_base, 3) if (model_precision is not None and m_base is not None) else None
+
         return {
-            "excess_vs_random": round(model_precision - r_base, 3),
-            "excess_vs_momentum": round(model_precision - m_base, 3),
+            "excess_vs_random": excess_r,
+            "excess_vs_momentum": excess_m,
             "random_baseline": r_base,
             "momentum_baseline": m_base
         }
