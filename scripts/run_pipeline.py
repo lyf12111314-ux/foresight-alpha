@@ -59,10 +59,20 @@ def run_full_pipeline_demo(force_refresh: bool = False):
     pool = pool_mgr.build_opportunity_pool()
     print(f" -> 成功生成 {len(pool)} 个候选技术机会画像")
     print("-" * 75)
-    print(f"{'排名':<4} {'技术主题':<22} {'综合评分':<10} {'置信度':<8} {'3年增长':<8} {'评级'}")
+    print(f"{'排名':<4} {'技术主题':<22} {'综合评分':<10} {'置信度':<10} {'3年增长':<10} {'评级'}")
     print("-" * 75)
     for rank, c in enumerate(pool, start=1):
-        print(f"{rank:<4} {c['topic_name']:<22} {c['composite_score']:<10.1f} {int(c['calibrated_confidence']*100)}%{'':<4} {c['growth_3y_multiple']}x{'':<5} {c['rating']}")
+        # 兼容处理未校准/None值以及字段契约演进
+        conf_val = c.get('calibrated_probability') or c.get('calibrated_prediction_probability') or c.get('calibrated_confidence')
+        conf_str = f"{int(conf_val * 100)}%" if conf_val is not None else "未校准"
+
+        growth_val = c.get('growth_3y_multiple')
+        growth_str = f"{growth_val}x" if growth_val is not None else "N/A"
+
+        score = c.get('composite_score', 0.0)
+        topic = c.get('topic_name', '未知主题')
+        rating = c.get('rating', 'UNRATED')
+        print(f"{rank:<4} {topic:<22} {score:<10.1f} {conf_str:<10} {growth_str:<10} {rating}")
     print("-" * 75)
 
     # 4. 商业化红旗与技术爆发监控巡检
@@ -80,25 +90,40 @@ def run_full_pipeline_demo(force_refresh: bool = False):
         cutoff_date=date(2021, 12, 31),
         evaluation_date=date(2024, 12, 31)
     )
-    m = bt_res["metrics"]
-    print(f" -> Top-3 预测命中率 Precision@3: {int(m['precision_at_3']*100)}%")
-    print(f" -> Top-5 预测命中率 Precision@5: {int(m['precision_at_5']*100)}%")
-    print(f" -> Brier 概率校准误差: {m['brier_score']}")
-    print(f" -> 相对随机基准超额命中: +{int(m['excess_vs_random_baseline']*100)}%")
+    m = bt_res.get("metrics", {})
+    p3 = m.get('precision_at_3')
+    p3_str = f"{int(p3 * 100)}%" if p3 is not None else "N/A (未验证模型/样本不足)"
+
+    p5 = m.get('precision_at_5')
+    p5_str = f"{int(p5 * 100)}%" if p5 is not None else "N/A (未验证模型/样本不足)"
+
+    brier = m.get('brier_score')
+    brier_str = f"{brier:.4f}" if isinstance(brier, (int, float)) else "N/A"
+
+    excess = m.get('excess_vs_random_baseline')
+    excess_str = f"+{int(excess * 100)}%" if excess is not None else "N/A"
+
+    print(f" -> Top-3 预测命中率 Precision@3: {p3_str}")
+    print(f" -> Top-5 预测命中率 Precision@5: {p5_str}")
+    print(f" -> Brier 概率校准误差: {brier_str}")
+    print(f" -> 相对随机基准超额命中: {excess_str}")
 
     # 6. 导出 Top 1 机会 14 章节智能研报
-    top_candidate = pool[0]
-    print(f"\n[Step 6] 为顶级机会 [{top_candidate['topic_name']}] 自动生成14章节结构化智能研报...")
-    dossier_gen = ResearchDossierGenerator()
-    report_text = dossier_gen.generate_dossier(top_candidate)
-    export_path = "data/exports/Foresight_Alpha_Sample_Dossier.md"
-    os.makedirs(os.path.dirname(export_path), exist_ok=True)
-    with open(export_path, "w", encoding="utf-8") as f:
-        f.write(report_text)
-    print(f" -> 完整深度研报已导出至: {export_path}")
+    if pool:
+        top_candidate = pool[0]
+        print(f"\n[Step 6] 为顶级机会 [{top_candidate.get('topic_name', 'Top1')}] 自动生成14章节结构化智能研报...")
+        dossier_gen = ResearchDossierGenerator()
+        report_text = dossier_gen.generate_dossier(top_candidate)
+        export_path = "data/exports/Foresight_Alpha_Sample_Dossier.md"
+        os.makedirs(os.path.dirname(export_path), exist_ok=True)
+        with open(export_path, "w", encoding="utf-8") as f:
+            f.write(report_text)
+        print(f" -> 完整深度研报已导出至: {export_path}")
+    else:
+        print("\n[Step 6] 机会候选池为空，跳过研报生成。")
 
     print("\n" + "=" * 80)
-    print("✅ 系统全流程运行完毕！所有数据已成功持久化至 data/storage.duckdb。")
+    print("✅ 系统全流程运行完毕！所有数据已成功持久化至 data/foresight.db。")
     print("👉 运行以下命令可一键启动交互式 Web 分析门户:")
     print("   bash scripts/start_ui.sh")
     print("=" * 80)
