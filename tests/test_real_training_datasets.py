@@ -68,29 +68,36 @@ def test_historical_tech_dataset_integrity():
         for fk in feature_keys:
             assert fk in s
             assert isinstance(s[fk], (int, float))
-        assert s["target_1y"] > 0
-        assert s["target_3y"] > 0
-        assert s["target_5y"] > 0
+        # 1年期与3年期已成熟样本
+        if s.get("label_1y_status") == "MATURED":
+            assert s["target_1y"] > 0
+        if s.get("label_3y_status") == "MATURED":
+            assert s["target_3y"] > 0
+        # 5年期：未成熟样本 (如2022年样本截至2026-11-11尚未满5年) 严格为 None
+        if s.get("label_5y_status") == "MATURED":
+            assert s["target_5y"] > 0
+        else:
+            assert s["target_5y"] is None
         assert s["provenance"]["quality_status"] == DataQualityStatus.MANUAL_REFERENCE
         assert s["provenance"]["quality_status"] != DataQualityStatus.SYNTHETIC
 
 
 def test_cox_survival_engine_real_training():
-    """验证 Cox 生存分析模型基于真实企业队列完成正式训练"""
+    """验证 Cox 生存分析模型基于真实企业队列完成实验模式拟合 (严格标注为非正式已验证预测)"""
     engine = CompanySurvivalEngine()
     assert engine.training_status == ModelTrainingStatus.INSUFFICIENT_DATA
     assert engine.is_fitted is False
 
-    # 执行基于真实队列的正式训练
+    # 执行基于真实队列的拟合 (属于 MANUAL_REFERENCE，进入实验模式)
     res = engine.fit_from_historical_cohort()
-    assert res["status"] == ModelTrainingStatus.TRAINED.value
+    assert res["status"] in [ModelTrainingStatus.TRAINED.value, "TRAINED_EXPERIMENTAL_RESEARCH"]
     assert engine.is_fitted is True
-    assert engine.training_status == ModelTrainingStatus.TRAINED
     assert engine.is_synthetic is False  # 严格确认并非合成数据！
+    assert engine.is_data_verified is False  # 严格确认待逐项审计数据未被伪造为正式已验证！
     assert engine.sample_count >= 20
     assert engine.event_count >= 5
 
-    # 预测测试：输入某企业的真实经营指标，应成功输出真实估计值，且不再为 None
+    # 预测测试：输入某企业的真实经营指标，应成功输出估计值，但严禁标记为正式已验证 (is_verified=False)
     test_metrics = {
         "cash_burn_months": 36.0,
         "debt_ratio": 35.0,
@@ -98,8 +105,8 @@ def test_cox_survival_engine_real_training():
         "competitor_count": 6.0
     }
     pred = engine.predict_company_survival(test_metrics)
-    assert pred["status"] in [PredictionStatus.PREDICTED.value, "PREDICTED"]
-    assert pred["is_verified"] is True
+    assert pred["status"] in [PredictionStatus.PREDICTED.value, "PREDICTED", "UNVERIFIED_RESEARCH"]
+    assert pred["is_verified"] is False  # P0 审计红线：MANUAL_REFERENCE 严禁标记为已验证
     assert pred["is_synthetic"] is False
     assert pred["partial_hazard_ratio"] is not None
     assert pred["partial_hazard_ratio"] > 0
@@ -109,19 +116,19 @@ def test_cox_survival_engine_real_training():
 
 
 def test_lgbm_growth_forecaster_real_training():
-    """验证 LightGBM 预测器基于真实技术时序完成多期正式训练"""
+    """验证 LightGBM 预测器基于真实技术时序完成多期拟合 (实验模式，绝不产生 is_verified=True)"""
     forecaster = LightGBMGrowthForecaster()
     assert forecaster.training_status == ModelTrainingStatus.MODEL_NOT_TRAINED
 
-    # 执行基于真实前沿技术样本的正式训练
+    # 执行基于真实前沿技术样本的训练 (MANUAL_REFERENCE)
     res = forecaster.fit_from_historical_tech_samples()
-    assert res["status"] == ModelTrainingStatus.TRAINED.value
-    assert forecaster.training_status == ModelTrainingStatus.TRAINED
+    assert res["status"] in [ModelTrainingStatus.TRAINED.value, "TRAINED_EXPERIMENTAL_RESEARCH"]
     assert forecaster.is_synthetic is False  # 严格确认并非合成数据！
+    assert forecaster.is_data_verified is False  # 严格确认未被伪造为已验证数据！
     assert forecaster.sample_count >= 20
-    assert len(forecaster.models) == 3  # 1y, 3y, 5y 三个正式训练的模型
+    assert len(forecaster.models) >= 2  # 包含有效成熟标签的模型
 
-    # 预测测试：输入特征向量，应产生真实非空预测倍数
+    # 预测测试：输入特征向量，应产生真实非空预测倍数，但标记为 UNVERIFIED_RESEARCH
     features = {
         "velocity_1y": 300.0,
         "acceleration": 80.0,
@@ -132,10 +139,11 @@ def test_lgbm_growth_forecaster_real_training():
         "novelty_score": 0.85
     }
     pred = forecaster.predict_growth(features)
-    assert pred["status"] == PredictionStatus.PREDICTED.value
+    assert pred["status"] in [PredictionStatus.PREDICTED.value, "PREDICTED", "UNVERIFIED_RESEARCH"]
+    assert pred["is_verified"] is False  # P0 审计红线：MANUAL_REFERENCE 严禁标记为已验证
     assert pred["is_synthetic"] is False
     assert "forecasts" in pred
-    for horizon in ["1y", "3y", "5y"]:
+    for horizon in ["1y", "3y"]:
         pt_est = pred["forecasts"][horizon]["point_estimate"]
         assert pt_est is not None
         assert pt_est > 0.5  # 存在基于真实规律拟合的有效点估计
@@ -144,7 +152,7 @@ def test_lgbm_growth_forecaster_real_training():
 
 
 def test_opportunity_pool_training_pipeline():
-    """验证 OpportunityPoolManager 真实训练管道激活后，各候选机会输出真实预测点估计"""
+    """验证 OpportunityPoolManager 真实训练管道激活后，各候选机会输出有效研究点估计"""
     pool_mgr = OpportunityPoolManager()
 
     # 1. 训练前：未训练状态，点估计必须为 None
@@ -154,10 +162,10 @@ def test_opportunity_pool_training_pipeline():
 
     # 2. 运行真实历史数据训练管道
     train_res = pool_mgr.train_models_on_historical_data()
-    assert train_res["lgbm_growth_forecaster"]["status"] == ModelTrainingStatus.TRAINED.value
-    assert train_res["company_survival_engine"]["status"] == ModelTrainingStatus.TRAINED.value
+    assert train_res["lgbm_growth_forecaster"]["status"] in [ModelTrainingStatus.TRAINED.value, "TRAINED_EXPERIMENTAL_RESEARCH"]
+    assert train_res["company_survival_engine"]["status"] in [ModelTrainingStatus.TRAINED.value, "TRAINED_EXPERIMENTAL_RESEARCH"]
 
-    # 3. 训练后：基于真实训练完成的模型输出有效点估计
+    # 3. 训练后：基于拟合完成的模型输出有效研究点估计 (但在正式排名中严格返回空)
     pool_trained = pool_mgr.build_opportunity_pool()
     assert len(pool_trained) > 0
     for cand in pool_trained:

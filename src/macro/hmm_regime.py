@@ -1,6 +1,12 @@
-"""宏观周期隐马尔可夫模型 (Gaussian HMM Macro Regime Switching Engine).
+"""基于高斯混合模型的宏观经济周期状态识别引擎 (GMM-Regime Macro Clustering Engine).
 
-严禁机械式按固定年份预言周期，采用连续概率状态转移推断：
+说明与审计界定：
+本模块使用高斯混合模型 (Gaussian Mixture Model, GMM) 对多维宏观时序指标 (PMI、PPI-CPI 剪刀差、M2同比、工业利润同比等)
+进行连续多状态聚类识别，并基于状态序列经验频率统计一阶转移概率。
+本模型并非基于 Baum-Welch 期望最大化联合优化潜状态序列的完整隐马尔可夫模型 (Hidden Markov Model)。
+在技术报告、模型元数据及对外研报中，明确标识为“高斯混合周期聚类模型 (GMM-Regime)”，杜绝学术概念夸大。
+
+四类宏观周期聚类状态：
 1. 繁荣扩张 (EXPANSION)
 2. 过热放缓 (SLOWDOWN)
 3. 紧缩衰退 (CONTRACTION)
@@ -15,7 +21,7 @@ from src.core.types import MacroRegime
 
 
 class MacroHMMRegimeModel:
-    """宏观经济状态隐马尔可夫与马尔可夫区制转换模型"""
+    """宏观经济状态高斯混合聚类与区制识别模型 (GMM-Regime)"""
 
     def __init__(self, n_regimes: int = 4, random_state: int = 42):
         self.n_regimes = n_regimes
@@ -147,3 +153,7 @@ class MacroHMMRegimeModel:
         latest["macro_implication"] = desc
         latest["transition_matrix"] = self.transition_matrix.tolist() if self.transition_matrix is not None else []
         return latest
+
+
+# 规范别名与向后兼容映射
+MacroGMMRegimeModel = MacroHMMRegimeModel
