@@ -165,7 +165,14 @@ class DatabaseManager:
                     brier_score DOUBLE,
                     excess_vs_random DOUBLE,
                     excess_vs_momentum DOUBLE,
-                    created_at TIMESTAMP NOT NULL
+                    created_at TIMESTAMP NOT NULL,
+                    backtest_type VARCHAR DEFAULT 'ML_PREDICTION_BACKTEST',
+                    forecast_status VARCHAR,
+                    historical_model_version VARCHAR,
+                    dataset_version VARCHAR,
+                    evaluable_sample_count INTEGER,
+                    unevaluable_sample_count INTEGER,
+                    validation_status VARCHAR
                 );
             """)
 
@@ -176,14 +183,17 @@ class DatabaseManager:
                     company_name VARCHAR NOT NULL,
                     industry_sector VARCHAR NOT NULL,
                     duration_months DOUBLE NOT NULL,
+                    observation_window_months DOUBLE,
                     is_distressed INTEGER NOT NULL,
                     distress_type VARCHAR NOT NULL,
+                    distress_event_type VARCHAR,
                     event_date DATE,
                     published_at TIMESTAMP NOT NULL,
-                    cash_burn_months DOUBLE NOT NULL,
+                    cash_burn_months DOUBLE,
                     debt_ratio DOUBLE NOT NULL,
                     gross_margin DOUBLE NOT NULL,
-                    competitor_count DOUBLE NOT NULL,
+                    competitor_count DOUBLE,
+                    is_covariate_audited BOOLEAN DEFAULT TRUE,
                     official_announcement_id VARCHAR,
                     source_url VARCHAR,
                     quality_status VARCHAR NOT NULL
@@ -197,6 +207,8 @@ class DatabaseManager:
                     topic_id VARCHAR NOT NULL,
                     base_date DATE NOT NULL,
                     published_at TIMESTAMP NOT NULL,
+                    feature_published_at TIMESTAMP,
+                    feature_ingested_at TIMESTAMP,
                     velocity_1y DOUBLE NOT NULL,
                     acceleration DOUBLE NOT NULL,
                     active_institutions DOUBLE NOT NULL,
@@ -204,14 +216,190 @@ class DatabaseManager:
                     macro_multiplier DOUBLE NOT NULL,
                     entropy_score DOUBLE NOT NULL,
                     novelty_score DOUBLE NOT NULL,
-                    target_1y DOUBLE NOT NULL,
-                    target_3y DOUBLE NOT NULL,
-                    target_5y DOUBLE NOT NULL,
+                    label_1y_period_end DATE,
+                    label_1y_status VARCHAR,
+                    target_1y DOUBLE,
+                    label_3y_period_end DATE,
+                    label_3y_status VARCHAR,
+                    target_3y DOUBLE,
+                    label_5y_period_end DATE,
+                    label_5y_status VARCHAR,
+                    target_5y DOUBLE,
                     quality_status VARCHAR NOT NULL
                 );
             """)
+
+            # 执行模式幂等升级与迁移
+            self.migrate_schema(conn)
         finally:
             conn.close()
+
+    def migrate_schema(self, conn=None):
+        """执行数据库模式幂等迁移，修复旧版本 NOT NULL 约束并增补审计字段，记录迁移历史"""
+        close_conn = False
+        if conn is None:
+            conn = self.get_connection()
+            close_conn = True
+        try:
+            # 确保迁移历史追踪表存在
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    migration_id VARCHAR PRIMARY KEY,
+                    version VARCHAR NOT NULL,
+                    applied_at TIMESTAMP NOT NULL,
+                    description VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL,
+                    error_message VARCHAR
+                );
+            """)
+
+            def _record_migration(m_id: str, ver: str, desc: str, status: str, err: Optional[str] = None):
+                conn.execute("""
+                    INSERT OR REPLACE INTO schema_migrations (migration_id, version, applied_at, description, status, error_message)
+                    VALUES (?, ?, ?, ?, ?, ?);
+                """, [m_id, ver, datetime.utcnow(), desc, status, err])
+
+            # 1. 迁移 tech_training_samples：去除 target 字段的 NOT NULL 约束，允许未成熟标签为 NULL
+            for tgt_col in ["target_1y", "target_3y", "target_5y"]:
+                m_id = f"mig_tech_drop_notnull_{tgt_col}"
+                try:
+                    conn.execute(f"ALTER TABLE tech_training_samples ALTER COLUMN {tgt_col} DROP NOT NULL;")
+                    _record_migration(m_id, "v1.1-p0", f"Drop NOT NULL on {tgt_col}", "SUCCESS")
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "does not have a not null constraint" in err_str or "already" in err_str or "not found" in err_str:
+                        _record_migration(m_id, "v1.1-p0", f"Drop NOT NULL on {tgt_col} (Idempotent)", "ALREADY_APPLIED", str(e))
+                    else:
+                        _record_migration(m_id, "v1.1-p0", f"Drop NOT NULL on {tgt_col} failed", "FAILED", str(e))
+                        raise RuntimeError(f"Database migration failed at drop NOT NULL for {tgt_col}: {e}")
+
+            for col, dtype in [
+                ("feature_published_at", "TIMESTAMP"),
+                ("feature_ingested_at", "TIMESTAMP"),
+                ("label_1y_period_end", "DATE"),
+                ("label_1y_status", "VARCHAR"),
+                ("label_3y_period_end", "DATE"),
+                ("label_3y_status", "VARCHAR"),
+                ("label_5y_period_end", "DATE"),
+                ("label_5y_status", "VARCHAR"),
+            ]:
+                m_id = f"mig_tech_add_{col}"
+                try:
+                    conn.execute(f"ALTER TABLE tech_training_samples ADD COLUMN IF NOT EXISTS {col} {dtype};")
+                    _record_migration(m_id, "v1.1-p0", f"Add column {col} to tech_training_samples", "SUCCESS")
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "already exists" in err_str:
+                        _record_migration(m_id, "v1.1-p0", f"Column {col} already exists", "ALREADY_APPLIED", str(e))
+                    else:
+                        _record_migration(m_id, "v1.1-p0", f"Add column {col} failed", "FAILED", str(e))
+                        raise RuntimeError(f"Database migration failed adding column {col}: {e}")
+
+            # 2. 迁移 company_distress_cohort：允许未核验协变量为 NULL 并补充事件类型
+            for cov_col in ["cash_burn_months", "competitor_count"]:
+                m_id = f"mig_cohort_drop_notnull_{cov_col}"
+                try:
+                    conn.execute(f"ALTER TABLE company_distress_cohort ALTER COLUMN {cov_col} DROP NOT NULL;")
+                    _record_migration(m_id, "v1.1-p0", f"Drop NOT NULL on {cov_col}", "SUCCESS")
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "does not have a not null constraint" in err_str or "already" in err_str or "not found" in err_str:
+                        _record_migration(m_id, "v1.1-p0", f"Drop NOT NULL on {cov_col} (Idempotent)", "ALREADY_APPLIED", str(e))
+                    else:
+                        _record_migration(m_id, "v1.1-p0", f"Drop NOT NULL on {cov_col} failed", "FAILED", str(e))
+                        raise RuntimeError(f"Database migration failed at drop NOT NULL for {cov_col}: {e}")
+
+            for col, dtype in [
+                ("observation_window_months", "DOUBLE"),
+                ("distress_event_type", "VARCHAR"),
+                ("is_covariate_audited", "BOOLEAN DEFAULT TRUE"),
+            ]:
+                m_id = f"mig_cohort_add_{col}"
+                try:
+                    conn.execute(f"ALTER TABLE company_distress_cohort ADD COLUMN IF NOT EXISTS {col} {dtype};")
+                    _record_migration(m_id, "v1.1-p0", f"Add column {col} to company_distress_cohort", "SUCCESS")
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "already exists" in err_str:
+                        _record_migration(m_id, "v1.1-p0", f"Column {col} already exists", "ALREADY_APPLIED", str(e))
+                    else:
+                        _record_migration(m_id, "v1.1-p0", f"Add column {col} failed", "FAILED", str(e))
+                        raise RuntimeError(f"Database migration failed adding column {col}: {e}")
+
+            # 3. 迁移 model_forecasts 字段
+            for col, dtype in [
+                ("prediction_status", "VARCHAR DEFAULT 'UNVERIFIED_RESEARCH'"),
+                ("is_verified_forecast", "BOOLEAN DEFAULT FALSE"),
+            ]:
+                m_id = f"mig_forecasts_add_{col}"
+                try:
+                    conn.execute(f"ALTER TABLE model_forecasts ADD COLUMN IF NOT EXISTS {col} {dtype};")
+                    _record_migration(m_id, "v1.1-p0", f"Add column {col} to model_forecasts", "SUCCESS")
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "already exists" in err_str:
+                        _record_migration(m_id, "v1.1-p0", f"Column {col} already exists", "ALREADY_APPLIED", str(e))
+                    else:
+                        _record_migration(m_id, "v1.1-p0", f"Add column {col} failed", "FAILED", str(e))
+                        raise RuntimeError(f"Database migration failed adding column {col}: {e}")
+
+            # 4. 迁移 backtest_runs 补充回测类型、模型版本与样本审计字段
+            for col, dtype in [
+                ("backtest_type", "VARCHAR DEFAULT 'ML_PREDICTION_BACKTEST'"),
+                ("forecast_status", "VARCHAR"),
+                ("historical_model_version", "VARCHAR"),
+                ("dataset_version", "VARCHAR"),
+                ("evaluable_sample_count", "INTEGER"),
+                ("unevaluable_sample_count", "INTEGER"),
+                ("validation_status", "VARCHAR")
+            ]:
+                m_id = f"mig_backtest_add_{col}"
+                try:
+                    conn.execute(f"ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS {col} {dtype};")
+                    _record_migration(m_id, "v1.1-p0", f"Add column {col} to backtest_runs", "SUCCESS")
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "already exists" in err_str:
+                        _record_migration(m_id, "v1.1-p0", f"Column {col} already exists", "ALREADY_APPLIED", str(e))
+                    else:
+                        _record_migration(m_id, "v1.1-p0", f"Add column {col} failed", "FAILED", str(e))
+
+            # 5. 迁移后模式完整性校验 (Post-Migration Schema Integrity Check)
+            self._verify_post_migration_integrity(conn)
+
+        finally:
+            if close_conn:
+                conn.close()
+
+    def _verify_post_migration_integrity(self, conn):
+        """校验关键表结构与字段完整性"""
+        tables = conn.execute("SHOW TABLES;").fetchall()
+        table_names = [t[0] for t in tables]
+        for req_table in ["tech_training_samples", "company_distress_cohort", "model_forecasts", "schema_migrations"]:
+            if req_table not in table_names:
+                raise RuntimeError(f"迁移后模式完整性校验失败：关键表 {req_table} 缺失。")
+
+    def execute_custom_migration_step(self, migration_id: str, sql: str, description: str, conn=None):
+        """执行独立迁移步骤并在失败时记录与抛出异常 (P1-15 规范)"""
+        close_conn = False
+        if conn is None:
+            conn = self.get_connection()
+            close_conn = True
+        try:
+            conn.execute(sql)
+            conn.execute("""
+                INSERT OR REPLACE INTO schema_migrations (migration_id, version, applied_at, description, status, error_message)
+                VALUES (?, ?, ?, ?, ?, ?);
+            """, [migration_id, "v1.1-custom", datetime.utcnow(), description, "SUCCESS", None])
+        except Exception as e:
+            conn.execute("""
+                INSERT OR REPLACE INTO schema_migrations (migration_id, version, applied_at, description, status, error_message)
+                VALUES (?, ?, ?, ?, ?, ?);
+            """, [migration_id, "v1.1-custom", datetime.utcnow(), description, "FAILED", str(e)])
+            raise RuntimeError(f"Database migration step '{migration_id}' failed: {e}")
+        finally:
+            if close_conn:
+                conn.close()
 
     def query_df(self, sql: str, params: Optional[List[Any]] = None) -> pd.DataFrame:
         """执行 SQL 查询并返回 Pandas DataFrame"""
@@ -256,7 +444,32 @@ class DatabaseManager:
         if target_col and target_val:
             sql += f" AND {target_col} = ?"
             params.append(target_val)
-        sql += " ORDER BY as_of_date ASC"
+
+        if require_verified_timestamp:
+            try:
+                cols_info = self.query_df(f"PRAGMA table_info('{table_name}')")
+                col_names = cols_info["name"].tolist() if not cols_info.empty else []
+                if "quality_status" in col_names:
+                    sql += " AND quality_status = 'VERIFIED'"
+                elif "is_verified" in col_names:
+                    sql += " AND (is_verified = TRUE OR is_verified = 1)"
+                else:
+                    # 表中无数据质量/核验标识，在严格校验下拒绝未核验时序数据
+                    sql += " AND 1 = 0"
+            except Exception as e:
+                # 严格模式下严禁静默忽略元数据检查异常，防止放宽过滤导致未核验数据或未来信息泄漏
+                raise RuntimeError(f"Point-in-Time 严格审计模式错误: 无法检查表 '{table_name}' 的数据质量元数据: {e}")
+
+        try:
+            cols_info = self.query_df(f"PRAGMA table_info('{table_name}')")
+            col_names = cols_info["name"].tolist() if not cols_info.empty else []
+            if "as_of_date" in col_names:
+                sql += " ORDER BY as_of_date ASC"
+            elif "base_date" in col_names:
+                sql += " ORDER BY base_date ASC"
+        except Exception:
+            pass
+
         return self.query_df(sql, params)
 
 

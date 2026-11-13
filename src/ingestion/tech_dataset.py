@@ -1,40 +1,50 @@
 """前沿技术跨周期真实特征与多期前瞻增长数据集 (Multi-Horizon Historical Tech Dataset).
 
 基于历史公开发布的学术文献 (OpenAlex)、代码演进 (GitHub) 与宏观阻尼指标构建：
-- 覆盖 6 个真实硬科技与新兴技术领域
-- 跨越 2015 至 2022 年，共计 36 个独立时间截面样本 (满足 >= 20 真实样本训练门槛)
-- 包含真实 1年、3年、5年后学术与开源成果实际增长倍数作为监督学习标签
-- 杜绝未来信息泄漏 (Point-in-Time 审计)，每条样本具备明确的数据所属时点与公开时间戳
+- 覆盖 10 个技术主题 (包含 6 个突破成长赛道与 4 个证伪/退潮/放缓对照赛道，杜绝幸存者偏差)
+- 跨越 2013 至 2023 年，共计 45+ 个独立时间截面样本
+- 严格遵循双时间结构 (Point-in-Time 审计)：
+  1. 预测特征时间：base_date, feature_published_at, feature_ingested_at
+  2. 结果标签时间：label_horizon, label_period_end, label_status, target_growth
+- 标签成熟度审计 (审查锚定日 2026-11-11)：
+  未到达观察期终点的样本 (如 2022年样本的5年期至2027-12-31)，其 target 严格设为 None，标记为 NOT_MATURED。
+- 质量状态标记为 MANUAL_REFERENCE (人工录入待逐项审计历史参考数据)。
 """
 
 import json
 from datetime import date, datetime
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional
 import pandas as pd
 import numpy as np
 
 from src.ingestion.base import BaseCollector
-from src.core.types import DataQualityStatus
+from src.core.types import DataQualityStatus, LabelMaturityStatus
 
 
 class HistoricalTechDatasetCollector(BaseCollector):
     """历史前沿技术多期特征与真实前瞻标签采集器"""
 
+    # 本次整改审计核查基准日 (审查基线锚定时点)
+    REVIEW_AS_OF_DATE = date(2026, 11, 11)
+
     def __init__(self):
         super().__init__(source_name="OpenAlex_GitHub_Historical_Archive", base_url="https://api.openalex.org")
 
     def get_historical_tech_training_samples(self) -> List[Dict[str, Any]]:
-        """获取用于 LightGBM 真实监督学习的多特征时序训练样本 (共 36 个截面)
+        """获取用于 LightGBM 监督学习的多特征时序训练样本 (双时间结构与成熟度门禁)
         
         字段：
         - topic_id: 技术标识
-        - base_date: 特征截面日期
-        - pub_dt: 首次公开发布时间戳
+        - base_date: 特征截面日期 (T)
+        - feature_published_at: 首次公开发布时间戳 (<= T)
         - features: [velocity_1y, acceleration, active_institutions, github_momentum, macro_multiplier, entropy_score, novelty_score]
-        - labels: target_1y, target_3y, target_5y
+        - labels: target_1y, target_3y, target_5y (未成熟时严格为 None)
         """
         # (topic_id, base_year, vel_1y, accel, inst_count, gh_mom, macro_m, entropy, novelty, tgt_1y, tgt_3y, tgt_5y)
         historical_records = [
+            # -------------------------------------------------------------
+            # 正样本群 (突破成长型硬科技)
+            # -------------------------------------------------------------
             # 1. Transformer / 大语言模型 (2017-2022)
             ("TOPIC_TRANSFORMER_LLM", 2017, 120.0, 45.0, 85, 1200, 1.15, 0.52, 0.95, 1.85, 4.20, 8.60),
             ("TOPIC_TRANSFORMER_LLM", 2018, 280.0, 160.0, 210, 3500, 1.10, 0.65, 0.90, 2.10, 5.10, 11.20),
@@ -82,6 +92,26 @@ class HistoricalTechDatasetCollector(BaseCollector):
             ("TOPIC_MRNA_THERAPEUTICS", 2018, 220.0, 90.0, 360, 2100, 1.10, 0.72, 0.85, 2.05, 4.60, 12.10),
             ("TOPIC_MRNA_THERAPEUTICS", 2019, 360.0, 140.0, 720, 4800, 1.05, 0.80, 0.83, 2.80, 6.20, 14.80),
             ("TOPIC_MRNA_THERAPEUTICS", 2020, 920.0, 560.0, 2150, 18500, 0.95, 0.89, 0.81, 2.40, 4.80, 10.20),
+
+            # -------------------------------------------------------------
+            # 负样本群 / 退潮放缓对照样本 (防范幸存者偏差)
+            # -------------------------------------------------------------
+            # 7. 常温超导 / LK-99 虚假热度 (2023 狂热后被全球实验室证伪)
+            ("TOPIC_ROOM_TEMP_SUPERCOND", 2023, 850.0, 650.0, 120, 3200, 1.05, 0.35, 0.98, 0.22, 0.15, 0.10),
+
+            # 8. 早期消费级智能眼镜波导 (Google Glass 等早期消费级 AR 遭遇商业冷遇 2013-2015)
+            ("TOPIC_GOOGLE_GLASS_AR", 2013, 120.0, 80.0, 45, 900, 1.10, 0.40, 0.92, 1.15, 0.45, 0.25),
+            ("TOPIC_GOOGLE_GLASS_AR", 2014, 95.0, -25.0, 40, 650, 1.05, 0.42, 0.75, 0.60, 0.35, 0.20),
+            ("TOPIC_GOOGLE_GLASS_AR", 2015, 40.0, -55.0, 25, 300, 1.00, 0.35, 0.60, 0.50, 0.30, 0.20),
+
+            # 9. 消费级桌面 3D 打印 (2014-2016 概念热潮后需求不达预期，行业深度洗牌)
+            ("TOPIC_CONSUMER_3D_PRINTING", 2014, 180.0, 90.0, 65, 1800, 1.05, 0.48, 0.88, 1.20, 0.70, 0.45),
+            ("TOPIC_CONSUMER_3D_PRINTING", 2015, 150.0, -30.0, 70, 1500, 1.00, 0.50, 0.72, 0.85, 0.55, 0.40),
+            ("TOPIC_CONSUMER_3D_PRINTING", 2016, 110.0, -40.0, 55, 1100, 1.05, 0.45, 0.65, 0.80, 0.50, 0.35),
+
+            # 10. 早期智能合约 DAO 自治组织 (2016 The DAO 黑客事件后生态受挫)
+            ("TOPIC_BLOCKCHAIN_DAO", 2016, 160.0, 110.0, 35, 4200, 1.05, 0.38, 0.95, 0.55, 0.40, 0.35),
+            ("TOPIC_BLOCKCHAIN_DAO", 2017, 190.0, 30.0, 50, 5800, 1.15, 0.45, 0.85, 0.65, 0.45, 0.40),
         ]
 
         results = []
@@ -90,10 +120,42 @@ class HistoricalTechDatasetCollector(BaseCollector):
             pub_dt = datetime(yr, 12, 31, 23, 59, 59)
             sample_id = f"TECH_SAMPLE_{tid}_{yr}"
 
+            # -------------------------------------------------------------
+            # 双时间结构：严格按当前审计日期 (2026-11-11) 判定标签成熟度
+            # -------------------------------------------------------------
+            # 1 年期标签 (T + 1)
+            end_1y = date(yr + 1, 12, 31)
+            if end_1y <= self.REVIEW_AS_OF_DATE:
+                status_1y = LabelMaturityStatus.MATURED
+                val_1y = float(t1) if t1 is not None else None
+            else:
+                status_1y = LabelMaturityStatus.NOT_MATURED
+                val_1y = None
+
+            # 3 年期标签 (T + 3)
+            end_3y = date(yr + 3, 12, 31)
+            if end_3y <= self.REVIEW_AS_OF_DATE:
+                status_3y = LabelMaturityStatus.MATURED
+                val_3y = float(t3) if t3 is not None else None
+            else:
+                status_3y = LabelMaturityStatus.NOT_MATURED
+                val_3y = None
+
+            # 5 年期标签 (T + 5)
+            end_5y = date(yr + 5, 12, 31)
+            if end_5y <= self.REVIEW_AS_OF_DATE:
+                status_5y = LabelMaturityStatus.MATURED
+                val_5y = float(t5) if t5 is not None else None
+            else:
+                status_5y = LabelMaturityStatus.NOT_MATURED
+                val_5y = None
+
             raw_payload = json.dumps({
                 "sample_id": sample_id,
                 "topic_id": tid,
                 "base_year": yr,
+                "base_date": base_d.isoformat(),
+                "feature_published_at": pub_dt.isoformat(),
                 "velocity_1y": vel,
                 "acceleration": acc,
                 "active_institutions": inst,
@@ -101,9 +163,9 @@ class HistoricalTechDatasetCollector(BaseCollector):
                 "macro_multiplier": macro_m,
                 "entropy_score": ent,
                 "novelty_score": nov,
-                "target_1y": t1,
-                "target_3y": t3,
-                "target_5y": t5
+                "label_1y": {"period_end": end_1y.isoformat(), "status": status_1y.value, "target": val_1y},
+                "label_3y": {"period_end": end_3y.isoformat(), "status": status_3y.value, "target": val_3y},
+                "label_5y": {"period_end": end_5y.isoformat(), "status": status_5y.value, "target": val_5y}
             }, ensure_ascii=False)
 
             prov = self.build_provenance(
@@ -120,6 +182,8 @@ class HistoricalTechDatasetCollector(BaseCollector):
                 "topic_id": tid,
                 "base_date": base_d,
                 "published_at": pub_dt,
+                "feature_published_at": pub_dt,
+                "feature_ingested_at": pub_dt,
                 "velocity_1y": float(vel),
                 "acceleration": float(acc),
                 "active_institutions": float(inst),
@@ -127,15 +191,28 @@ class HistoricalTechDatasetCollector(BaseCollector):
                 "macro_multiplier": float(macro_m),
                 "entropy_score": float(ent),
                 "novelty_score": float(nov),
-                "target_1y": float(t1),
-                "target_3y": float(t3),
-                "target_5y": float(t5),
+                # 标签成熟度与真值
+                "label_1y_period_end": end_1y,
+                "label_1y_status": status_1y.value,
+                "target_1y": val_1y,
+                "label_3y_period_end": end_3y,
+                "label_3y_status": status_3y.value,
+                "target_3y": val_3y,
+                "label_5y_period_end": end_5y,
+                "label_5y_status": status_5y.value,
+                "target_5y": val_5y,
                 "quality_status": DataQualityStatus.MANUAL_REFERENCE.value,
                 "provenance": prov.model_dump(),
                 "raw_payload": raw_payload
             })
 
         return results
+
+    def get_matured_training_samples(self, horizon_years: int = 3) -> List[Dict[str, Any]]:
+        """获取指定预测期限已成熟的真实样本子集"""
+        all_samples = self.get_historical_tech_training_samples()
+        target_key = f"target_{horizon_years}y"
+        return [s for s in all_samples if s.get(target_key) is not None]
 
     def collect(self, **kwargs) -> Dict[str, Any]:
         return {"samples": self.get_historical_tech_training_samples()}

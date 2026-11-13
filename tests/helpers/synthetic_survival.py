@@ -29,10 +29,10 @@ def generate_synthetic_survival_cohort(n_samples: int = 250, random_state: int =
         competitor_count * 0.06
     )
     base_hazard = np.exp(risk_score)
-    survival_years = np.random.exponential(scale=15.0 / (base_hazard + 0.1))
-    observed_T = np.clip(survival_years, 0.5, 12.0)
+    survival_months = np.random.exponential(scale=180.0 / (base_hazard + 0.1))
+    observed_T = np.clip(survival_months, 6.0, 144.0)
 
-    censoring_time = np.random.uniform(3.0, 10.0, size=n)
+    censoring_time = np.random.uniform(36.0, 120.0, size=n)
     event_E = (observed_T <= censoring_time).astype(int)
     duration_T = np.minimum(observed_T, censoring_time)
 

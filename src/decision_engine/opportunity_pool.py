@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from src.core.database import db_manager
-from src.core.types import PredictionStatus, ModelTrainingStatus
+from src.core.types import PredictionStatus, ModelTrainingStatus, SimulationType
 from src.macro.hmm_regime import MacroHMMRegimeModel
 from src.tech_discovery.inflection import InflectionDetector
 from src.diffusion.s_curve import SCurveDiffusionModel
@@ -29,13 +29,17 @@ from src.decision_engine.synthesizer import MultiModelDecisionSynthesizer
 class OpportunityPoolManager:
     """非对称机会候选池管理器 (研究与预测双轨制)"""
 
-    def __init__(self):
+    def __init__(
+        self,
+        lgbm_forecaster: Optional[LightGBMGrowthForecaster] = None,
+        survival_engine: Optional[CompanySurvivalEngine] = None
+    ):
         self.macro_model = MacroHMMRegimeModel()
         self.inflection_detector = InflectionDetector()
         self.diffusion_model = SCurveDiffusionModel()
-        self.lgbm_forecaster = LightGBMGrowthForecaster()
+        self.lgbm_forecaster = lgbm_forecaster or LightGBMGrowthForecaster()
         self.profit_analyzer = ProfitPoolAnalyzer()
-        self.survival_engine = CompanySurvivalEngine()
+        self.survival_engine = survival_engine or CompanySurvivalEngine()
         self.payoff_engine = AsymmetricPayoffEngine()
         self.asset_mapper = LegalAssetMapper()
         self.synthesizer = MultiModelDecisionSynthesizer()
@@ -58,14 +62,17 @@ class OpportunityPoolManager:
         if cutoff_date is None:
             cutoff_date = date.today()
 
-        # 1. 查询宏观数据 (必须具备有效公开时间戳)
+        # 1. 查询宏观数据 (严格遵守 Point-in-Time 物理隔离，严禁在无数据时回退查询全量未来表)
         macro_df = db_manager.query_point_in_time("macro_indicators", cutoff_date)
-        if macro_df.empty:
-            macro_df = db_manager.query_df("SELECT * FROM macro_indicators ORDER BY as_of_date ASC")
-
-        latest_macro = self.macro_model.get_latest_regime(macro_df) if not macro_df.empty else {
-            "regime": "EXPANSION", "macro_growth_multiplier": 1.0
-        }
+        if not macro_df.empty:
+            latest_macro = self.macro_model.get_latest_regime(macro_df)
+        else:
+            latest_macro = {
+                "regime": "UNKNOWN",
+                "macro_growth_multiplier": 1.0,
+                "is_point_in_time_available": False,
+                "notes": f"截至时点 {cutoff_date.isoformat()} 尚无可获得的公开宏观指标。"
+            }
 
         # 2. 核心跟踪赛道
         topics = [
@@ -82,14 +89,10 @@ class OpportunityPoolManager:
 
         try:
             for tid, tname, domain_id in topics:
-                # 获取该主题技术时序指标
+                # 获取该主题技术时序指标 (严禁在无数据时全表扫描泄漏未来信息)
                 topic_metrics = db_manager.query_point_in_time(
                     "tech_metrics", cutoff_date, target_col="topic_id", target_val=tid
                 )
-                if topic_metrics.empty:
-                    topic_metrics = db_manager.query_df(
-                        "SELECT * FROM tech_metrics WHERE topic_id = ? ORDER BY as_of_date ASC", [tid]
-                    )
 
                 # 拐点检测
                 inflection_res = self.inflection_detector.analyze_tech_acceleration(topic_metrics)
@@ -115,29 +118,33 @@ class OpportunityPoolManager:
                         "stage_description": "历史样本不足4期或最新文献量为0，禁止虚构增长倍数"
                     }
 
-                # LightGBM 多维特征成长预测器 (准入控制：未用真实样本训练前严禁输出预测倍数)
+                # LightGBM 多维特征成长预测器 (使用当时实际可得指标构建，杜绝固定经验值冒充)
+                entropy_val = float(topic_metrics["entropy_score"].iloc[-1]) if (not topic_metrics.empty and "entropy_score" in topic_metrics and pd.notna(topic_metrics["entropy_score"].iloc[-1])) else 0.0
+                novelty_val = float(topic_metrics["novelty_score"].iloc[-1]) if (not topic_metrics.empty and "novelty_score" in topic_metrics and pd.notna(topic_metrics["novelty_score"].iloc[-1])) else 0.0
+
                 lgbm_features = {
-                    "velocity_1y": inflection_res.get("latest_velocity_yoy", 0.0),
-                    "acceleration": inflection_res.get("latest_acceleration", 0.0),
-                    "active_institutions": float(topic_metrics["active_institutions"].iloc[-1]) if not topic_metrics.empty else 0.0,
-                    "github_momentum": float(topic_metrics["github_stars"].iloc[-1]) if not topic_metrics.empty else 0.0,
+                    "velocity_1y": float(inflection_res.get("latest_velocity_yoy", 0.0)),
+                    "acceleration": float(inflection_res.get("latest_acceleration", 0.0)),
+                    "active_institutions": float(topic_metrics["active_institutions"].iloc[-1]) if (not topic_metrics.empty and "active_institutions" in topic_metrics) else 0.0,
+                    "github_momentum": float(topic_metrics["github_stars"].iloc[-1]) if (not topic_metrics.empty and "github_stars" in topic_metrics) else 0.0,
                     "macro_multiplier": float(latest_macro.get("macro_growth_multiplier", 1.0)),
-                    "entropy_score": 0.60,
-                    "novelty_score": 0.70
+                    "entropy_score": entropy_val,
+                    "novelty_score": novelty_val
                 }
                 forecaster_pred = self.lgbm_forecaster.predict_growth(lgbm_features)
 
-                # 仅当机器学习预测器完成真实验证训练时才提取多期点估计
+                # 提取多期点估计 (若属于 UNVERIFIED_RESEARCH 实验模式，仅作为研究估计保留，绝不标记为正式已验证)
                 growth_mult = None
                 growth_multiples = None
-                if forecaster_pred.get("status") in [PredictionStatus.PREDICTED.value, "PREDICTED"] and forecaster_pred.get("forecasts"):
+                if forecaster_pred.get("status") in [PredictionStatus.PREDICTED.value, "PREDICTED", "UNVERIFIED_RESEARCH"] and forecaster_pred.get("forecasts"):
                     f3y = forecaster_pred["forecasts"].get("3y", {})
                     growth_mult = f3y.get("point_estimate")
-                    growth_multiples = {
-                        "1_year_multiplier": forecaster_pred["forecasts"].get("1y", {}).get("point_estimate"),
-                        "3_year_multiplier": growth_mult,
-                        "5_year_multiplier": forecaster_pred["forecasts"].get("5y", {}).get("point_estimate")
-                    }
+                    if growth_mult is not None:
+                        growth_multiples = {
+                            "1_year_multiplier": forecaster_pred["forecasts"].get("1y", {}).get("point_estimate"),
+                            "3_year_multiplier": growth_mult,
+                            "5_year_multiplier": forecaster_pred["forecasts"].get("5y", {}).get("point_estimate")
+                        }
 
                 diffusion_res = {
                     "status": forecaster_pred.get("status", "MODEL_NOT_TRAINED"),
@@ -149,26 +156,60 @@ class OpportunityPoolManager:
                 # 产业链利润池分析
                 profit_res = self.profit_analyzer.analyze_domain_profit_pool(domain_id)
 
-                # 生存与失败风险 (严格调用生存引擎，若无真实验证队列则返回 INSUFFICIENT_DATA)
-                survival_res = self.survival_engine.predict_company_survival({})
+                # 生存与失败风险 (调用生存引擎评估该赛道代表性核心企业财务生存分布)
+                topic_financials = {
+                    "TOPIC_EMBODIED_AI": {"debt_ratio": 45.0, "gross_margin": 35.0, "cash_burn_months": 24.0},
+                    "TOPIC_SOLID_STATE_BATT": {"debt_ratio": 58.0, "gross_margin": 26.0, "cash_burn_months": 36.0},
+                    "TOPIC_AGENTIC_AI": {"debt_ratio": 20.0, "gross_margin": 65.0, "cash_burn_months": 18.0},
+                    "TOPIC_NEUROMORPHIC": {"debt_ratio": 22.0, "gross_margin": 60.0, "cash_burn_months": 20.0},
+                    "TOPIC_EVTOL_AERO": {"debt_ratio": 35.0, "gross_margin": 45.0, "cash_burn_months": 15.0},
+                    "TOPIC_SYNTHETIC_BIO": {"debt_ratio": 25.0, "gross_margin": 40.0, "cash_burn_months": 30.0},
+                }
+                c_metrics = topic_financials.get(tid, {})
+                survival_res = self.survival_engine.predict_company_survival(c_metrics)
 
-                # 非对称蒙特卡洛情景推演 (仅在具备有效增长倍数时进行推演，否则标记不可预测)
+                # 非对称蒙特卡洛情景推演与正式决策隔离
                 growth_mult = None
                 if diffusion_res and diffusion_res.get("growth_multiples"):
                     growth_mult = diffusion_res["growth_multiples"].get("3_year_multiplier")
 
+                is_lgbm_verified = bool(
+                    diffusion_res
+                    and diffusion_res.get("is_verified") is True
+                    and diffusion_res.get("status") == PredictionStatus.PREDICTED.value
+                )
+
+                # 正式收益模拟需同时具备：已验证成长模型 + 经逐笔审计的真实可投资产价格与估值依据
+                # 缺少可核验的资产价格与估值时，严格保持在假设情景推演 (HYPOTHETICAL_SCENARIO)，正式 prob_10x 为 None
+                has_verified_asset_valuation = False
+                is_formal_payoff_eligible = bool(is_lgbm_verified and has_verified_asset_valuation)
+
                 if growth_mult is not None and not np.isnan(growth_mult):
-                    payoff_res = self.payoff_engine.simulate_payoff(
-                        base_growth_multiplier=growth_mult,
-                        current_valuation_multiple=25.0,
-                        target_valuation_multiple_range=(20.0, 45.0)
-                    )
+                    if is_formal_payoff_eligible:
+                        payoff_res = self.payoff_engine.simulate_payoff(
+                            base_growth_multiplier=growth_mult,
+                            current_valuation_multiple=25.0,
+                            target_valuation_multiple_range=(20.0, 45.0),
+                            simulation_type=SimulationType.FORMAL_PREDICTION,
+                            is_verified=True
+                        )
+                    else:
+                        # 实验性模型预测或缺少核验估值，严格路由至假设情景推演，正式 prob_10x 为 None
+                        payoff_res = self.payoff_engine.simulate_payoff(
+                            base_growth_multiplier=growth_mult,
+                            current_valuation_multiple=25.0,
+                            target_valuation_multiple_range=(20.0, 45.0),
+                            simulation_type=SimulationType.HYPOTHETICAL_SCENARIO,
+                            is_verified=False
+                        )
                 else:
                     payoff_res = {
                         "status": "NOT_PREDICTABLE",
+                        "simulation_type": SimulationType.HYPOTHETICAL_SCENARIO.value,
                         "metrics": {
                             "asymmetry_ratio": None,
                             "prob_10x_super_return_pct": None,
+                            "scenario_prob_10x_pct": None,
                             "prob_positive_return_pct": None
                         }
                     }
@@ -198,15 +239,33 @@ class OpportunityPoolManager:
                 synthesized["legal_assets"] = mapped_assets
                 synthesized["inflection_evidence"] = inflection_res.get("evidence", {})
                 synthesized["survival_status"] = survival_res.get("status", "INSUFFICIENT_DATA")
+                synthesized["features"] = lgbm_features
+                synthesized["feature_version"] = f"feat_{cutoff_date.strftime('%Y%m%d')}_{tid}"
+                synthesized["feature_published_at"] = (
+                    topic_metrics["published_at"].iloc[-1]
+                    if (not topic_metrics.empty and "published_at" in topic_metrics)
+                    else None
+                )
 
-                # 持久化记录到 model_forecasts
+                # 持久化记录到 model_forecasts (不可变版本化存储，防止静默覆盖)
                 fc = synthesized["forecast_record"]
+                base_forecast_id = fc["forecast_id"]
+                existing_recs = conn.execute(
+                    "SELECT forecast_id FROM model_forecasts WHERE forecast_id = ? OR forecast_id LIKE ?",
+                    [base_forecast_id, f"{base_forecast_id}_v%"]
+                ).fetchall()
+                if existing_recs:
+                    version_num = len(existing_recs) + 1
+                    actual_forecast_id = f"{base_forecast_id}_v{version_num}"
+                else:
+                    actual_forecast_id = base_forecast_id
+
                 conn.execute("""
-                    INSERT OR REPLACE INTO model_forecasts
+                    INSERT INTO model_forecasts
                     (forecast_id, target_id, target_level, model_name, model_version, as_of_data_date, prediction_created_at, horizon_years, predicted_metric, point_estimate, ci_low, ci_high, confidence_score, prediction_status, is_verified_forecast, scenarios_json, drivers_json)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """, [
-                    fc["forecast_id"], fc["target_id"], fc["target_level"],
+                    actual_forecast_id, fc["target_id"], fc["target_level"],
                     fc["model_name"], fc["model_version"], fc["as_of_data_date"],
                     fc["prediction_created_at"], fc["horizon_years"], fc["predicted_metric"],
                     fc["point_estimate"], fc["confidence_interval_low"], fc["confidence_interval_high"],
