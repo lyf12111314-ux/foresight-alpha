@@ -2,14 +2,39 @@
 
 import pytest
 import pandas as pd
-from datetime import date
+from datetime import date, timedelta
 from src.macro.hmm_regime import MacroHMMRegimeModel
 from src.macro.cycle_filter import MacroCycleFilter
-from src.core.database import db_manager
+from src.core.database import DatabaseManager
 
 
-def test_macro_hmm_regime_model():
-    macro_df = db_manager.query_df("SELECT * FROM macro_indicators ORDER BY as_of_date ASC")
+def test_macro_hmm_regime_model(tmp_path):
+    temp_db = DatabaseManager(db_path=str(tmp_path / "macro_test.duckdb"))
+    conn = temp_db.get_connection()
+    try:
+        base = date(2020, 1, 1)
+        for i in range(16):
+            d = base + timedelta(days=90 * i)
+            conn.execute(
+                """
+                INSERT INTO macro_indicators
+                (indicator_code, as_of_date, published_at, indicator_name, value, unit, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                ["FED_RATE", d, d, "Federal Funds Rate", 1.5 + 0.25 * (i % 5), "%", "TEST_FIXTURE"],
+            )
+            conn.execute(
+                """
+                INSERT INTO macro_indicators
+                (indicator_code, as_of_date, published_at, indicator_name, value, unit, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                ["GDP_YOY", d, d, "Real GDP YoY", 2.0 + 0.4 * ((i + 2) % 4), "%", "TEST_FIXTURE"],
+            )
+    finally:
+        conn.close()
+
+    macro_df = temp_db.query_df("SELECT * FROM macro_indicators ORDER BY as_of_date ASC")
     assert not macro_df.empty
 
     model = MacroHMMRegimeModel()

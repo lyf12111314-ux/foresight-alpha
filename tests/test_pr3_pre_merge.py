@@ -327,8 +327,38 @@ def test_p0_02_experimental_and_rule_backtests_stored_separately():
 # 三、P0-03: 历史预测特征向量完整传递与杜绝默认值冒充
 # =============================================================================
 
-def test_p0_03_different_candidates_have_distinct_feature_vectors():
+def test_p0_03_different_candidates_have_distinct_feature_vectors(tmp_path, monkeypatch):
     """10. 机会池中不同技术主题保存各自真实特征向量，且不使用硬编码固定 0.6/0.7"""
+    import src.core.database as db_module
+    import src.decision_engine.opportunity_pool as opp_pool
+    from src.core.database import DatabaseManager
+
+    temp_db = DatabaseManager(db_path=str(tmp_path / "pr3_p0_03.duckdb"))
+    monkeypatch.setattr(db_module, "db_manager", temp_db)
+    monkeypatch.setattr(opp_pool, "db_manager", temp_db)
+
+    conn = temp_db.get_connection()
+    try:
+        topic_seeds = [
+            ("TOPIC_EMBODIED_AI", 12, 30, 6, 120, 0.55, 0.72),
+            ("TOPIC_SOLID_STATE_BATT", 28, 85, 11, 450, 0.68, 0.81),
+            ("TOPIC_AGENTIC_AI", 45, 140, 15, 980, 0.79, 0.90),
+            ("TOPIC_NEUROMORPHIC", 18, 50, 8, 260, 0.62, 0.76),
+        ]
+        for tid, p_base, c_base, inst_base, stars_base, ent, nov in topic_seeds:
+            for idx, yr in enumerate([2019, 2020, 2021]):
+                d = date(yr, 6, 30)
+                conn.execute(
+                    """
+                    INSERT INTO tech_metrics
+                    (topic_id, as_of_date, published_at, papers_count, citations_count, active_institutions, github_stars, github_forks, commit_velocity, entropy_score, novelty_score)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [tid, d, d, p_base * (idx + 1), c_base * (idx + 1), inst_base + idx, stars_base * (idx + 1), 25 * (idx + 1), 1.2 + idx * 0.4, ent, nov],
+                )
+    finally:
+        conn.close()
+
     forecaster = LightGBMGrowthForecaster()
     pool_mgr = OpportunityPoolManager(lgbm_forecaster=forecaster)
     cutoff = date(2021, 12, 31)
