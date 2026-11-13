@@ -270,15 +270,6 @@ class CompanySurvivalEngine:
                 "rejection_reason": audit_res.get("rejection_reason"),
                 "message": f"样本外跨周期生存验证未通过：{audit_res.get('rejection_reason')}，保持基准模型状态，禁止用于正式预测。"
             }
-            self.training_status = ModelTrainingStatus.INSUFFICIENT_DATA
-            self.model_stage = ModelStage.UNTRAINED
-            self.rejection_reason = str(e)
-            return {
-                "status": ModelTrainingStatus.INSUFFICIENT_DATA.value,
-                "model_stage": self.model_stage.value,
-                "is_verified": False,
-                "error": str(e)
-            }
 
     def fit_experimental(
         self,
