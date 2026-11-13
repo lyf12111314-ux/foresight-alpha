@@ -1,0 +1,17 @@
+[flake8]
+# Foresight Alpha 最小兼容静态检查配置
+max-line-length = 120
+exclude =
+    .git,
+    __pycache__,
+    .venv,
+    venv,
+    build,
+    dist,
+    data,
+    .pytest_cache,
+    data/exports
+
+# 忽略非关键的格式性警告，优先聚焦语法错误、未定义变量和关键异常
+extend-ignore = E203, E501, W503, E402
+max-complexity = 18
