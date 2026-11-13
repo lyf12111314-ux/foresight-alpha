@@ -123,7 +123,7 @@ def run_full_pipeline_demo(force_refresh: bool = False):
         print("\n[Step 6] 机会候选池为空，跳过研报生成。")
 
     print("\n" + "=" * 80)
-    print("✅ 系统全流程运行完毕！所有数据已成功持久化至 data/foresight.db。")
+    print("✅ 系统全流程运行完毕！所有数据已成功持久化至 data/storage.duckdb。")
     print("👉 运行以下命令可一键启动交互式 Web 分析门户:")
     print("   bash scripts/start_ui.sh")
     print("=" * 80)

@@ -38,10 +38,13 @@
 
 ### 阶段 D：独立审计 (Independent Audit / Code Review)
 完成一个可提交的逻辑单元后，执行独立代码审查：
-1. **独立审查上下文**：使用独立的审查看板、独立审查 Subagent 或外部 Review 流程（如 Codex `/review`）进行审查。
-2. **事实证据原则**：审计方必须**直接阅读源代码文件与实际 Git 差异**，不得以开发者的口头承诺或自我总结作为通过依据。
+1. **独立审查上下文**：使用独立的审查看板、独立审查 Subagent 或外部 Review 流程（如 Codex `/review` 或 GitHub PR Review）进行审查。
+2. **事实证据原则**：审计方必须**直接阅读源代码文件与实际 Git 差异 (`git diff`)**，不得以开发者的口头承诺或自我总结作为通过依据。
 3. **审计职责边界**：审计方只负责客观发现问题、指出缺陷代码文件与行号、提供复现证据与风险定级（P0 阻断性、P1 严重、P2 一般），**严禁直接动手修改业务代码**。
-4. **审查环境声明**：若在单 Agent 会话中由自身执行二次审查，必须在审计记录中如实声明“属于同一工具体系内的二次自审，不构成完全独立的第三方 QA 结论”。
+4. **审查关联与门禁分离铁律**：
+   - 每一份独立审查结论必须明确绑定当前具体的 **`commit SHA`**；
+   - **GitHub Actions / CI 通过不代表独立 Code Review 已完成；Code Review 通过也不代表自动化测试已通过**，两项门禁必须分别记录、独立签收。
+5. **审查环境与授权声明**：若在单 Agent 会话中由自身执行二次审查（如 Codex `/review`），必须在审计记录中如实声明“属于同一工具体系内的二次自审，不构成完全独立的第三方 QA 结论”。若需要仓库管理员在 GitHub Settings 开启 Branch Protection 或自动 PR Review（如 Copilot/Codex App 授权），必须明确列出所需操作，严禁假装已启用。
 
 ### 阶段 E：整改与回归 (Remediation & Regression)
 1. **P0/P1 问题闭环**：审计中识别出的任何 P0（数据伪造、前视偏差、未经验证冒充正式模型、越权绕过等）和 P1 问题，必须交回开发流程进行定向修复。
@@ -106,29 +109,29 @@
 
 ## 三、自动化持续集成质量门禁 (CI Quality Gate)
 
-为确保代码库长期健康，项目配备自动化持续集成测试门禁。每次向 PR 分支推送代码时，自动执行五项核心检查：
+为确保代码库长期健康，项目配备本地与云端完全一致的强阻断质量门禁 (`bash scripts/run_ci_checks.sh` 及 `.github/workflows/quality-gate.yml`)。每次向 PR 分支推送代码时，自动执行五项核心检查：
 
 1. **Python 语法完整性检查**：
    ```bash
    python -m compileall -q src scripts tests
    ```
-2. **静态代码质量检查 (flake8 最小兼容配置)**：
+2. **静态代码质量检查 (flake8 强阻断配置，缺失工具直接失败，禁止降级)**：
    ```bash
    flake8 src scripts tests --count --select=E9,F63,F7,F82 --show-source --statistics
-   flake8 src scripts tests --count --max-line-length=120 --statistics
    ```
-3. **全量自动化测试验证**：
+3. **空 DuckDB 数据库初始化与原生系统表检查**：
+   使用 DuckDB 原生 `information_schema.tables` 验证在全新临时路径下能否顺利创建核心表结构。
+4. **无外部网络依赖的离线端到端集成测试**：
+   ```bash
+   pytest tests/test_offline_e2e.py -v
+   ```
+   使用临时 DuckDB 文件、显式标记为 `SYNTHETIC` / `TEST_ONLY` 的测试夹具并全局阻断外部网络请求。
+5. **全量自动化测试验证**：
    ```bash
    pytest -v
    ```
-4. **空数据库初始化与数据隔离测试**：
-   验证在全新临时路径下能否顺利创建核心表结构。
-5. **无外部网络依赖的端到端集成测试**：
-   ```bash
-   pytest tests/test_end_to_end.py -v
-   ```
 
-**【门禁铁律】**：测试失败时，CI 流程必须显式返回非零退出码（失败状态），严禁通过重定向、忽略错误码或在 YAML 中使用 `continue-on-error: true` 掩盖错误。
+**【门禁铁律】**：测试失败或静态工具缺失时，CI 流程必须显式返回非零退出码（失败状态），严禁通过重定向、忽略错误码、降级为 AST 解析或在 YAML 中使用 `continue-on-error: true` 掩盖错误。
 
 ---
 

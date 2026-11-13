@@ -1,4 +1,4 @@
-name: CI Quality Gate
+name: Quality Gate
 
 on:
   push:
@@ -10,13 +10,10 @@ on:
   pull_request:
     branches:
       - main
-      - 'fix/**'
-      - 'feat/**'
-      - 'chore/**'
 
 jobs:
   quality-gate:
-    name: Run Automated Quality Gate
+    name: Foresight Alpha Automated Quality Gate
     runs-on: ubuntu-latest
 
     steps:
@@ -33,42 +30,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install flake8
 
-      - name: Gate 1 - Python Syntax & Compilation Check
+      - name: Run Unified CI Quality Gate
         run: |
-          python -m compileall -q src scripts tests
-
-      - name: Gate 2 - Code Static Linting (flake8 minimal)
-        run: |
-          flake8 src scripts tests --count --select=E9,F63,F7,F82 --show-source --statistics
-          flake8 src scripts tests --count --max-line-length=120 --statistics
-
-      - name: Gate 3 - Empty Database Initialization Check
-        run: |
-          python -c "
-          import tempfile, os
-          from src.core.database import DatabaseManager
-          with tempfile.TemporaryDirectory() as tmpdir:
-              test_db = os.path.join(tmpdir, 'clean_init.db')
-              mgr = DatabaseManager(db_path=test_db)
-              if hasattr(mgr, 'initialize_database'):
-                  mgr.initialize_database()
-              else:
-                  mgr.init_schema()
-              with mgr.get_connection() as conn:
-                  cursor = conn.cursor()
-                  cursor.execute(\"SELECT name FROM sqlite_master WHERE type='table';\")
-                  tables = [r[0] for r in cursor.fetchall()]
-                  assert 'tech_training_samples' in tables
-                  assert 'model_forecasts' in tables
-          print('Clean database init check passed.')
-          "
-
-      - name: Gate 4 - End-to-End Pipeline One-Click Run Check
-        run: |
-          python scripts/run_pipeline.py
-
-      - name: Gate 5 - Pytest Full Regression Suite
-        run: |
-          pytest -v
+          bash scripts/run_ci_checks.sh
