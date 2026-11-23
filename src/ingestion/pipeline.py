@@ -284,7 +284,15 @@ class IngestionPipeline:
             ]
             for topic_id, kw in github_keywords:
                 repos = self.github.search_repositories(kw, max_items=5, save_snapshots=True)
+                saved_gh_snaps = set()
+                if getattr(self.github, "last_snapshot_meta", None):
+                    lmeta = self.github.last_snapshot_meta
+                    db_manager.save_raw_snapshot(lmeta, conn=conn)
+                    saved_gh_snaps.add(lmeta["snapshot_id"])
                 for r in repos:
+                    if r.get("snapshot_meta") and r["snapshot_meta"]["snapshot_id"] not in saved_gh_snaps:
+                        db_manager.save_raw_snapshot(r["snapshot_meta"], conn=conn)
+                        saved_gh_snaps.add(r["snapshot_meta"]["snapshot_id"])
                     prov = r["provenance"]
                     conn.execute("""
                         INSERT OR REPLACE INTO raw_records 

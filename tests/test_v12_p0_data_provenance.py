@@ -513,3 +513,67 @@ def test_g_missing_features_refused_in_formal_mode_and_is_verified_contract(tmp_
     ok_pred = forecaster.predict_growth(complete_features, require_complete_features=True)
     assert ok_pred["status"] == "PREDICTED"
     assert ok_pred["is_verified"] is True
+
+
+def test_p1_same_day_pit_visibility_and_pipeline_snapshot_consistency(tmp_path, monkeypatch):
+    """回归验证 P1 修复：当日非零点 ingested_utc 可被 date.today() 检索，且 GitHub 快照落库无悬空引用"""
+    temp_db = _setup_isolated_db(tmp_path, monkeypatch)
+
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    # 若恰好是 UTC 零点附近也保证用非零点时刻测试
+    non_midnight_today = datetime(now_utc.year, now_utc.month, now_utc.day, 14, 25, 30)
+    conn = temp_db.get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO tech_metrics
+            (topic_id, as_of_date, published_at, papers_count, citations_count, active_institutions, github_pit_eligible)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ["TOPIC_SOLID_STATE_BATT", date(2020, 12, 31), non_midnight_today, 1847, 419, None, False],
+        )
+    finally:
+        conn.close()
+
+    # 当日实盘研究视角 (date.today()) 应能查到今日刚采入库、non-midnight TIMESTAMP 的记录
+    df_today = temp_db.query_point_in_time("tech_metrics", date.today(), target_col="topic_id", target_val="TOPIC_SOLID_STATE_BATT")
+    assert len(df_today) == 1
+    assert df_today["papers_count"].iloc[0] == 1847
+
+    # 历史回测视角 (2020-12-31) 依然严格隔离该 2026 年才采集的记录
+    df_2020 = temp_db.query_point_in_time("tech_metrics", date(2020, 12, 31), target_col="topic_id", target_val="TOPIC_SOLID_STATE_BATT")
+    assert df_2020.empty
+
+    # 模拟 pipeline 写入 GitHub 快照，确认 raw_records.snapshot_id 在 raw_snapshots 中完整存在且文件可哈希校验
+    pipe = IngestionPipeline()
+    pipe.openalex.snapshot_dir = str(tmp_path / "oa_snaps")
+    pipe.github.snapshot_dir = str(tmp_path / "gh_snaps")
+
+    def fake_gh_get(url, params=None, timeout=None):
+        payload = {
+            "items": [
+                {
+                    "id": 913533710,
+                    "full_name": "stanford-developers/steer-opencell-design",
+                    "stargazers_count": 12,
+                    "forks_count": 3,
+                    "open_issues_count": 1,
+                    "created_at": "2025-01-07T21:44:38Z",
+                    "updated_at": "2026-10-30T17:27:27Z",
+                    "html_url": "https://github.com/stanford-developers/steer-opencell-design",
+                    "description": "test",
+                }
+            ]
+        }
+        return _mock_json_response(payload, 200)
+
+    monkeypatch.setattr(pipe.github.session, "get", fake_gh_get)
+    repos = pipe.github.search_repositories("solid-state-battery", max_items=1, save_snapshots=True)
+    assert len(repos) == 1 and repos[0]["snapshot_meta"] is not None
+
+    conn = temp_db.get_connection()
+    try:
+        temp_db.save_raw_snapshot(repos[0]["snapshot_meta"], conn=conn)
+    finally:
+        conn.close()
+    assert temp_db.verify_snapshot_file_integrity(repos[0]["snapshot_id"])["verified"] is True

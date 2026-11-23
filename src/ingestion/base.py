@@ -12,6 +12,7 @@ from datetime import datetime, date, timezone
 from typing import Dict, Any, Optional, Tuple
 from urllib.parse import urlencode
 
+from src.core.config import get_project_root
 from src.core.types import (
     ProvenanceMetadata,
     DataQualityStatus,
@@ -44,13 +45,32 @@ class BaseCollector(ABC):
         return hashlib.sha256(raw_bytes).hexdigest()
 
     @staticmethod
+    def _portable_path(path: str) -> str:
+        """若路径位于仓库根目录内，转为跨机器可复用的相对路径（POSIX 风格）"""
+        abs_p = os.path.abspath(path)
+        root_p = os.path.abspath(str(get_project_root()))
+        try:
+            if os.path.commonpath([root_p, abs_p]) == root_p:
+                return os.path.relpath(abs_p, root_p).replace(os.sep, "/")
+        except ValueError:
+            pass
+        return abs_p
+
+    @staticmethod
+    def _resolve_snapshot_path(path: str) -> str:
+        if os.path.isabs(path):
+            return path
+        return os.path.join(str(get_project_root()), path)
+
+    @staticmethod
     def verify_snapshot_integrity(snapshot_path: str, expected_sha256: str) -> Dict[str, Any]:
         """重新读取快照原始字节计算 SHA-256，校验内容完整性（不等于历史时点可信）"""
         if not snapshot_path or not expected_sha256:
             return {"content_integrity_verified": False, "reason": "缺少快照路径或预期 SHA-256"}
-        if not os.path.exists(snapshot_path):
-            return {"content_integrity_verified": False, "reason": f"快照文件不存在: {snapshot_path}"}
-        with open(snapshot_path, "rb") as f:
+        resolved = BaseCollector._resolve_snapshot_path(snapshot_path)
+        if not os.path.exists(resolved):
+            return {"content_integrity_verified": False, "reason": f"快照文件不存在: {resolved}"}
+        with open(resolved, "rb") as f:
             actual_hash = hashlib.sha256(f.read()).hexdigest()
         matched = actual_hash.lower() == str(expected_sha256).lower()
         return {
@@ -164,10 +184,11 @@ class BaseCollector(ABC):
             snapshot_id = f"{safe_prefix}_{ts_str}_{raw_sha256[:12]}_{rand_hex}"
             # 允许按内容哈希去重保存物理载荷文件，同时每次采集均写入不可覆盖的元数据记录
             raw_filename = f"{safe_prefix}_{raw_sha256[:16]}.raw.json"
-            raw_path = os.path.abspath(os.path.join(snapshot_dir, raw_filename))
-            if not os.path.exists(raw_path):
-                with open(raw_path, "wb") as f:
+            raw_abs_path = os.path.abspath(os.path.join(snapshot_dir, raw_filename))
+            if not os.path.exists(raw_abs_path):
+                with open(raw_abs_path, "wb") as f:
                     f.write(raw_bytes)
+            raw_path = self._portable_path(raw_abs_path)
             integrity_check = self.verify_snapshot_integrity(raw_path, raw_sha256)
             content_integrity_verified = bool(integrity_check.get("content_integrity_verified", False))
             source_authenticity = "REAL_HTTP_200_RESPONSE"
@@ -198,10 +219,10 @@ class BaseCollector(ABC):
             historical_availability_status=historical_eligibility.value,
         )
 
-        meta_path = os.path.abspath(os.path.join(snapshot_dir, f"{snapshot_id}.meta.json"))
+        meta_abs_path = os.path.abspath(os.path.join(snapshot_dir, f"{snapshot_id}.meta.json"))
         meta_dict = record.model_dump(mode="json")
-        meta_dict["meta_path"] = meta_path
-        with open(meta_path, "w", encoding="utf-8") as mf:
+        meta_dict["meta_path"] = self._portable_path(meta_abs_path)
+        with open(meta_abs_path, "w", encoding="utf-8") as mf:
             json.dump(meta_dict, mf, ensure_ascii=False, indent=2, default=str)
 
         return meta_dict

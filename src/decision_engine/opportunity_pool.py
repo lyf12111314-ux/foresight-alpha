@@ -98,9 +98,14 @@ class OpportunityPoolManager:
                 inflection_res = self.inflection_detector.analyze_tech_acceleration(topic_metrics)
 
                 # 扩散S曲线拟合 (用于学术文献扩散拐点研判，严禁直接等同于产业/投资成长倍数)
-                if not topic_metrics.empty and len(topic_metrics) >= 4 and topic_metrics["papers_count"].iloc[-1] > 0:
-                    years = np.array([d.year if hasattr(d, "year") else int(str(d)[:4]) for d in topic_metrics["as_of_date"]])
-                    papers = topic_metrics["papers_count"].values
+                valid_scurve = (
+                    topic_metrics[pd.notna(topic_metrics["papers_count"])]
+                    if (not topic_metrics.empty and "papers_count" in topic_metrics.columns)
+                    else topic_metrics.iloc[0:0]
+                )
+                if not valid_scurve.empty and len(valid_scurve) >= 4 and float(valid_scurve["papers_count"].iloc[-1]) > 0:
+                    years = np.array([d.year if hasattr(d, "year") else int(str(d)[:4]) for d in valid_scurve["as_of_date"]])
+                    papers = valid_scurve["papers_count"].astype(float).values
                     try:
                         s_curve_res = self.diffusion_model.fit_and_forecast(years, papers, forecast_horizon_years=5)
                     except Exception:

@@ -401,9 +401,16 @@ class OpenAlexCollector(BaseCollector):
                     "filter": f"publication_year:{year}",
                     "group_by": "authorships.institutions.id",
                 }
-                inst_resp, inst_status, _ = self.fetch_raw_with_audit(url, params=inst_params)
+                inst_resp, inst_status, inst_err = self.fetch_raw_with_audit(url, params=inst_params)
                 used_complete_agg = False
+                inst_raw_bytes: Optional[bytes] = None
+                inst_parse_err: Optional[str] = None
                 if inst_resp is not None and inst_status == 200:
+                    inst_raw_bytes = (
+                        inst_resp.content
+                        if isinstance(inst_resp.content, (bytes, bytearray))
+                        else inst_resp.text.encode("utf-8")
+                    )
                     try:
                         inst_json = inst_resp.json()
                         inst_groups = inst_json.get("group_by") if isinstance(inst_json, dict) else None
@@ -419,8 +426,30 @@ class OpenAlexCollector(BaseCollector):
                                 active_institutions = len(valid_group_ids)
                                 inst_scope = InstitutionCountScope.COMPLETE_AGGREGATION.value
                                 used_complete_agg = True
-                    except (ValueError, TypeError):
-                        pass
+                        else:
+                            inst_parse_err = "INST_MALFORMED_GROUP_BY"
+                    except (ValueError, TypeError) as exc:
+                        inst_parse_err = f"INST_JSON_PARSE_ERROR: {exc}"
+                else:
+                    inst_parse_err = inst_err or f"INST_HTTP_{inst_status}_FAILED"
+
+                if save_snapshots:
+                    self.save_raw_response_snapshot(
+                        snapshot_dir=self.snapshot_dir,
+                        request_url=url,
+                        query_params=inst_params,
+                        http_status=inst_status,
+                        raw_bytes=inst_raw_bytes if inst_parse_err is None else None,
+                        as_of_date=as_of_date,
+                        verified_first_available_at=None,
+                        quality_status=DataQualityStatus.UNVERIFIED if inst_parse_err is None else DataQualityStatus.UNAVAILABLE,
+                        historical_eligibility=HistoricalEligibilityStatus.CURRENT_SNAPSHOT_HISTORICAL_STATS
+                        if inst_parse_err is None
+                        else HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE,
+                        error_message=inst_parse_err,
+                        ingested_at_utc=ingested_utc,
+                        file_prefix=f"openalex_{query}_{year}_institutions",
+                    )
 
                 if not used_complete_agg:
                     # 无法取得全量唯一机构数时，严禁用 *12 或 *0.15 放大采样数，正式特征保持 None 并明确标为采样统计
@@ -497,7 +526,7 @@ class OpenAlexCollector(BaseCollector):
         return results
 
     def collect(self, **kwargs) -> Dict[str, Any]:
-        query = kwargs.get("query", "solid-state battery")
+        query = kwargs.get("query", '"solid-state battery"')
         start_year = kwargs.get("start_year", 2018)
         end_year = kwargs.get("end_year", 2025)
         return {

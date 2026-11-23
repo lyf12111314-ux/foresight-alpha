@@ -1,0 +1,24 @@
+{
+  "snapshot_id": "openalex__solid-state_battery__2023_institutions_20261123T153955Z_4096cc653716_1d685de8",
+  "source_name": "OpenAlex",
+  "request_url": "https://api.openalex.org/works?search=%22solid-state+battery%22&filter=publication_year%3A2023&group_by=authorships.institutions.id",
+  "query_params": {
+    "search": "\"solid-state battery\"",
+    "filter": "publication_year:2023",
+    "group_by": "authorships.institutions.id"
+  },
+  "http_status": 200,
+  "ingested_at_utc": "2026-11-23T15:39:55.286983",
+  "as_of_date": "2023-12-31",
+  "verified_first_available_at": null,
+  "quality_status": "UNVERIFIED",
+  "raw_sha256": "4096cc653716376244f0ab615c88ba9c06766dd256063a082232a59e98c83073",
+  "snapshot_path": "data/snapshots/openalex/openalex__solid-state_battery__2023_institutions_4096cc6537163762.raw.json",
+  "processor_code_version": "v1.2-p0-data-provenance",
+  "historical_eligibility": "CURRENT_SNAPSHOT_HISTORICAL_STATS",
+  "error_message": null,
+  "content_integrity_verified": true,
+  "source_authenticity_status": "REAL_HTTP_200_RESPONSE",
+  "historical_availability_status": "CURRENT_SNAPSHOT_HISTORICAL_STATS",
+  "meta_path": "data/snapshots/openalex/openalex__solid-state_battery__2023_institutions_20261123T153955Z_4096cc653716_1d685de8.meta.json"
+}

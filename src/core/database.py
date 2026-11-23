@@ -555,9 +555,10 @@ class DatabaseManager:
         expected_hash = rec.get("raw_sha256")
         if not snap_path or not expected_hash:
             return {"verified": False, "reason": "快照记录缺少文件路径或原始 SHA-256 摘要"}
-        if not os.path.exists(snap_path):
-            return {"verified": False, "reason": f"快照文件不存在: {snap_path}"}
-        with open(snap_path, "rb") as f:
+        resolved_path = snap_path if os.path.isabs(snap_path) else os.path.join(str(get_project_root()), snap_path)
+        if not os.path.exists(resolved_path):
+            return {"verified": False, "reason": f"快照文件不存在: {resolved_path}"}
+        with open(resolved_path, "rb") as f:
             actual_hash = hashlib.sha256(f.read()).hexdigest()
         if actual_hash.lower() != str(expected_hash).lower():
             return {
@@ -569,7 +570,7 @@ class DatabaseManager:
         return {
             "verified": True,
             "snapshot_id": snapshot_id,
-            "snapshot_path": snap_path,
+            "snapshot_path": resolved_path,
             "sha256": actual_hash,
             "historical_eligibility": rec.get("historical_eligibility"),
             "verified_first_available_at": rec.get("verified_first_available_at")
@@ -585,15 +586,24 @@ class DatabaseManager:
     ) -> pd.DataFrame:
         """严格的 Point-in-Time 查询接口。
         
-        确保在 cutoff_date 时点，只读取当时已公开披露的数据 (published_at <= cutoff_date)，
+        确保在 cutoff_date 时点，只读取当时已公开披露的数据 (published_at <= cutoff_date 当日结束时刻)，
         彻底防止未来信息泄露 (Lookahead Bias)。
         若 require_verified_timestamp=True，仅允许经过时间验证且发布时间可信的数据参与计算。
         """
+        if isinstance(cutoff_date, datetime):
+            cutoff_ts = cutoff_date
+        else:
+            cutoff_ts = datetime(cutoff_date.year, cutoff_date.month, cutoff_date.day, 23, 59, 59, 999999)
+            if cutoff_date == date.today():
+                utc_now = datetime.utcnow()
+                if utc_now > cutoff_ts:
+                    cutoff_ts = utc_now
+
         sql = f"""
             SELECT * FROM {table_name}
             WHERE published_at IS NOT NULL AND published_at <= ?
         """
-        params = [cutoff_date]
+        params = [cutoff_ts]
         if target_col and target_val:
             sql += f" AND {target_col} = ?"
             params.append(target_val)

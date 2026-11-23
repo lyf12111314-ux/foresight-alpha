@@ -50,9 +50,10 @@ class GithubCollector(BaseCollector):
         ingested_utc = datetime.now(timezone.utc).replace(tzinfo=None)
         repos: List[Dict[str, Any]] = []
 
+        self.last_snapshot_meta: Optional[Dict[str, Any]] = None
         if resp is None or http_status != 200:
             if save_snapshots:
-                self.save_raw_response_snapshot(
+                self.last_snapshot_meta = self.save_raw_response_snapshot(
                     snapshot_dir=self.snapshot_dir,
                     request_url=url,
                     query_params=params,
@@ -69,11 +70,31 @@ class GithubCollector(BaseCollector):
             return repos
 
         raw_bytes = resp.content if isinstance(resp.content, (bytes, bytearray)) else resp.text.encode("utf-8")
+        parse_err: Optional[str] = None
+        data: Any = None
         try:
             data = resp.json()
             if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-                return repos
-        except (ValueError, TypeError):
+                parse_err = "GITHUB_MALFORMED_RESPONSE_MISSING_ITEMS"
+        except (ValueError, TypeError) as exc:
+            parse_err = f"GITHUB_JSON_PARSE_ERROR: {exc}"
+
+        if parse_err is not None:
+            if save_snapshots:
+                self.last_snapshot_meta = self.save_raw_response_snapshot(
+                    snapshot_dir=self.snapshot_dir,
+                    request_url=url,
+                    query_params=params,
+                    http_status=http_status,
+                    raw_bytes=None,
+                    as_of_date=ingested_utc.date(),
+                    verified_first_available_at=None,
+                    quality_status=DataQualityStatus.UNAVAILABLE,
+                    historical_eligibility=HistoricalEligibilityStatus.CURRENT_STATE_ONLY,
+                    error_message=parse_err,
+                    ingested_at_utc=ingested_utc,
+                    file_prefix=f"github_{topic_keyword}",
+                )
             return repos
 
         snap_meta = None
@@ -92,6 +113,7 @@ class GithubCollector(BaseCollector):
                 ingested_at_utc=ingested_utc,
                 file_prefix=f"github_{topic_keyword}",
             )
+            self.last_snapshot_meta = snap_meta
 
         for item in data.get("items", []):
             if not isinstance(item, dict):
@@ -146,6 +168,8 @@ class GithubCollector(BaseCollector):
                 "ingested_at_utc": ingested_utc,
                 "historical_eligibility": HistoricalEligibilityStatus.CURRENT_STATE_ONLY.value,
                 "pit_eligible": False,
+                "snapshot_id": snap_meta["snapshot_id"] if snap_meta else None,
+                "snapshot_meta": snap_meta,
                 "provenance": prov.model_dump(),
                 "raw_payload": raw_json,
             })
