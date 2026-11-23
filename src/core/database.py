@@ -5,6 +5,7 @@
 
 import os
 import json
+import hashlib
 import duckdb
 import pandas as pd
 from datetime import datetime, date
@@ -229,6 +230,29 @@ class DatabaseManager:
                 );
             """)
 
+            # 10. 原始 API 响应快照与三层真实性存证表 (V1.2 P0)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS raw_snapshots (
+                    snapshot_id VARCHAR PRIMARY KEY,
+                    source_name VARCHAR NOT NULL,
+                    request_url VARCHAR NOT NULL,
+                    query_params JSON,
+                    http_status INTEGER,
+                    ingested_at_utc TIMESTAMP NOT NULL,
+                    as_of_date DATE NOT NULL,
+                    verified_first_available_at TIMESTAMP,
+                    quality_status VARCHAR NOT NULL,
+                    raw_sha256 VARCHAR,
+                    snapshot_path VARCHAR,
+                    processor_code_version VARCHAR NOT NULL,
+                    historical_eligibility VARCHAR NOT NULL,
+                    error_message VARCHAR,
+                    content_integrity_verified BOOLEAN DEFAULT FALSE,
+                    source_authenticity_status VARCHAR,
+                    historical_availability_status VARCHAR
+                );
+            """)
+
             # 执行模式幂等升级与迁移
             self.migrate_schema(conn)
         finally:
@@ -364,6 +388,58 @@ class DatabaseManager:
                     else:
                         _record_migration(m_id, "v1.1-p0", f"Add column {col} failed", "FAILED", str(e))
 
+            # 4.5. V1.2 原始快照表与 tech_metrics/raw_records 审计列幂等增补
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS raw_snapshots (
+                    snapshot_id VARCHAR PRIMARY KEY,
+                    source_name VARCHAR NOT NULL,
+                    request_url VARCHAR NOT NULL,
+                    query_params JSON,
+                    http_status INTEGER,
+                    ingested_at_utc TIMESTAMP NOT NULL,
+                    as_of_date DATE NOT NULL,
+                    verified_first_available_at TIMESTAMP,
+                    quality_status VARCHAR NOT NULL,
+                    raw_sha256 VARCHAR,
+                    snapshot_path VARCHAR,
+                    processor_code_version VARCHAR NOT NULL,
+                    historical_eligibility VARCHAR NOT NULL,
+                    error_message VARCHAR,
+                    content_integrity_verified BOOLEAN DEFAULT FALSE,
+                    source_authenticity_status VARCHAR,
+                    historical_availability_status VARCHAR
+                );
+            """)
+            for col, dtype in [
+                ("snapshot_id", "VARCHAR"),
+                ("historical_eligibility", "VARCHAR"),
+                ("institution_count_scope", "VARCHAR"),
+                ("citations_cutoff_year", "INTEGER"),
+                ("github_pit_eligible", "BOOLEAN")
+            ]:
+                m_id = f"mig_tech_metrics_add_{col}"
+                try:
+                    conn.execute(f"ALTER TABLE tech_metrics ADD COLUMN IF NOT EXISTS {col} {dtype};")
+                    _record_migration(m_id, "v1.2-p0", f"Add column {col} to tech_metrics", "SUCCESS")
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "already exists" in err_str:
+                        _record_migration(m_id, "v1.2-p0", f"Column {col} already exists", "ALREADY_APPLIED", str(e))
+                    else:
+                        _record_migration(m_id, "v1.2-p0", f"Add column {col} failed", "FAILED", str(e))
+                        raise RuntimeError(f"Database migration failed adding column {col} to tech_metrics: {e}")
+
+            try:
+                conn.execute("ALTER TABLE raw_records ADD COLUMN IF NOT EXISTS snapshot_id VARCHAR;")
+                _record_migration("mig_raw_records_add_snapshot_id", "v1.2-p0", "Add column snapshot_id to raw_records", "SUCCESS")
+            except Exception as e:
+                err_str = str(e).lower()
+                if "already exists" in err_str:
+                    _record_migration("mig_raw_records_add_snapshot_id", "v1.2-p0", "Column snapshot_id already exists", "ALREADY_APPLIED", str(e))
+                else:
+                    _record_migration("mig_raw_records_add_snapshot_id", "v1.2-p0", "Add column snapshot_id failed", "FAILED", str(e))
+                    raise RuntimeError(f"Database migration failed adding snapshot_id to raw_records: {e}")
+
             # 5. 迁移后模式完整性校验 (Post-Migration Schema Integrity Check)
             self._verify_post_migration_integrity(conn)
 
@@ -375,7 +451,7 @@ class DatabaseManager:
         """校验关键表结构与字段完整性"""
         tables = conn.execute("SHOW TABLES;").fetchall()
         table_names = [t[0] for t in tables]
-        for req_table in ["tech_training_samples", "company_distress_cohort", "model_forecasts", "schema_migrations"]:
+        for req_table in ["tech_training_samples", "company_distress_cohort", "model_forecasts", "schema_migrations", "raw_snapshots"]:
             if req_table not in table_names:
                 raise RuntimeError(f"迁移后模式完整性校验失败：关键表 {req_table} 缺失。")
 
@@ -421,6 +497,83 @@ class DatabaseManager:
                 conn.execute(sql)
         finally:
             conn.close()
+
+    def save_raw_snapshot(self, snapshot_meta: Dict[str, Any], conn=None) -> None:
+        """写入原始 API 响应快照元数据至 raw_snapshots (不可覆盖既有快照记录)"""
+        close_conn = False
+        if conn is None:
+            conn = self.get_connection()
+            close_conn = True
+        try:
+            qparams = snapshot_meta.get("query_params", {})
+            qparams_json = json.dumps(qparams, sort_keys=True, ensure_ascii=False) if not isinstance(qparams, str) else qparams
+            conn.execute("""
+                INSERT INTO raw_snapshots (
+                    snapshot_id, source_name, request_url, query_params, http_status,
+                    ingested_at_utc, as_of_date, verified_first_available_at, quality_status,
+                    raw_sha256, snapshot_path, processor_code_version, historical_eligibility,
+                    error_message, content_integrity_verified, source_authenticity_status,
+                    historical_availability_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(snapshot_id) DO NOTHING;
+            """, [
+                snapshot_meta["snapshot_id"],
+                snapshot_meta["source_name"],
+                snapshot_meta["request_url"],
+                qparams_json,
+                snapshot_meta.get("http_status"),
+                snapshot_meta["ingested_at_utc"],
+                snapshot_meta["as_of_date"],
+                snapshot_meta.get("verified_first_available_at"),
+                snapshot_meta["quality_status"],
+                snapshot_meta.get("raw_sha256"),
+                snapshot_meta.get("snapshot_path"),
+                snapshot_meta.get("processor_code_version", "v1.2-p0-data-provenance"),
+                snapshot_meta.get("historical_eligibility", "HISTORICAL_VINTAGE_UNAVAILABLE"),
+                snapshot_meta.get("error_message"),
+                bool(snapshot_meta.get("content_integrity_verified", False)),
+                snapshot_meta.get("source_authenticity_status", "UNVERIFIED_EXTERNAL_API"),
+                snapshot_meta.get("historical_availability_status", "HISTORICAL_VINTAGE_UNAVAILABLE"),
+            ])
+        finally:
+            if close_conn:
+                conn.close()
+
+    def get_raw_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
+        """按 snapshot_id 查询原始快照审计记录"""
+        df = self.query_df("SELECT * FROM raw_snapshots WHERE snapshot_id = ? LIMIT 1;", [snapshot_id])
+        if df.empty:
+            return None
+        return df.iloc[0].to_dict()
+
+    def verify_snapshot_file_integrity(self, snapshot_id: str) -> Dict[str, Any]:
+        """重新读取快照原始字节计算 SHA-256，校验内容完整性是否被篡改"""
+        rec = self.get_raw_snapshot(snapshot_id)
+        if not rec:
+            return {"verified": False, "reason": f"未找到快照记录: {snapshot_id}"}
+        snap_path = rec.get("snapshot_path")
+        expected_hash = rec.get("raw_sha256")
+        if not snap_path or not expected_hash:
+            return {"verified": False, "reason": "快照记录缺少文件路径或原始 SHA-256 摘要"}
+        if not os.path.exists(snap_path):
+            return {"verified": False, "reason": f"快照文件不存在: {snap_path}"}
+        with open(snap_path, "rb") as f:
+            actual_hash = hashlib.sha256(f.read()).hexdigest()
+        if actual_hash.lower() != str(expected_hash).lower():
+            return {
+                "verified": False,
+                "expected_sha256": expected_hash,
+                "actual_sha256": actual_hash,
+                "reason": "快照文件内容已被修改，SHA-256 一致性校验失败"
+            }
+        return {
+            "verified": True,
+            "snapshot_id": snapshot_id,
+            "snapshot_path": snap_path,
+            "sha256": actual_hash,
+            "historical_eligibility": rec.get("historical_eligibility"),
+            "verified_first_available_at": rec.get("verified_first_available_at")
+        }
 
     def query_point_in_time(
         self,

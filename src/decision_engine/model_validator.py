@@ -67,8 +67,13 @@ class TrustedValidationRegistry:
         registration.sample_count = len(registration.samples)
 
         # 数据集注册不能仅由业务调用方直接自设 audit_status=VERIFIED 而取得生产准入资格
-        # 必须具备第三方权威机构审计凭证 (has_independent_audit_certificate)
-        if registration.audit_status == DataQualityStatus.VERIFIED and not registration.has_independent_audit_certificate:
+        # 必须具备第三方权威机构审计凭证 (has_independent_audit_certificate)，且审计机构不得为空或自报占位名称
+        self_declared_authorities = {"", "self", "internal", "internal_research_prototype", "auto"}
+        auth_norm = str(getattr(registration, "audit_authority", "") or "").strip().lower()
+        if (
+            registration.audit_status == DataQualityStatus.VERIFIED
+            and (not registration.has_independent_audit_certificate or auth_norm in self_declared_authorities)
+        ):
             registration.is_audited_production_ready = False
             registration.audit_status = DataQualityStatus.UNVERIFIED
 

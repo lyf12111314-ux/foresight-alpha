@@ -8,6 +8,7 @@
 5. 数据不足或未核验时，不输出虚构成长倍数，明确说明准入拒绝原因。
 """
 
+import re
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
@@ -17,12 +18,14 @@ from src.core.types import (
     ModelTrainingStatus,
     ModelStage,
     DataQualityStatus,
+    HistoricalEligibilityStatus,
     ModelVerificationInfo,
     OOSValidationRecord,
     ValidationExecutionType,
     OOSValidationDataset,
     OOSValidationSample
 )
+from src.ingestion.base import BaseCollector
 
 
 class LightGBMGrowthForecaster:
@@ -141,11 +144,24 @@ class LightGBMGrowthForecaster:
                 "message": reason
             }
 
+        ineligible_hist_states = {
+            HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
+            HistoricalEligibilityStatus.CURRENT_STATE_ONLY.value,
+            HistoricalEligibilityStatus.CURRENT_SNAPSHOT_HISTORICAL_STATS.value,
+        }
         for idx, prov in enumerate(provenance_records):
             p_status = getattr(prov, "quality_status", None) or (prov.get("quality_status") if isinstance(prov, dict) else None)
             p_hash = getattr(prov, "raw_hash", None) or (prov.get("raw_hash") if isinstance(prov, dict) else None)
-            if p_status not in [DataQualityStatus.VERIFIED, DataQualityStatus.VERIFIED.value, "VERIFIED"] or not p_hash:
-                reason = f"正式训练准入门禁拒绝：血缘记录 #{idx} 质量状态非 VERIFIED 或缺失不可篡改哈希签名。"
+            p_hist = getattr(prov, "historical_eligibility", None) or (prov.get("historical_eligibility") if isinstance(prov, dict) else None)
+            p_snap_path = getattr(prov, "snapshot_path", None) or (prov.get("snapshot_path") if isinstance(prov, dict) else None)
+
+            if hasattr(p_status, "value"):
+                p_status = p_status.value
+            if hasattr(p_hist, "value"):
+                p_hist = p_hist.value
+
+            if p_status != DataQualityStatus.VERIFIED.value or not p_hash or not re.fullmatch(r"[0-9a-fA-F]{64}", str(p_hash).strip()):
+                reason = f"正式训练准入门禁拒绝：血缘记录 #{idx} 质量状态非 VERIFIED 或缺少有效 64 位十六进制 SHA-256 签名。"
                 self._reset_to_untrained(reason)
                 return {
                     "status": ModelTrainingStatus.MODEL_NOT_TRAINED.value,
@@ -154,6 +170,30 @@ class LightGBMGrowthForecaster:
                     "rejection_reason": reason,
                     "message": reason
                 }
+
+            if p_hist in ineligible_hist_states:
+                reason = f"正式训练准入门禁拒绝：血缘记录 #{idx} 历史资格状态为 {p_hist}，不具备严格 PIT 历史准入资格。"
+                self._reset_to_untrained(reason)
+                return {
+                    "status": ModelTrainingStatus.MODEL_NOT_TRAINED.value,
+                    "model_stage": self.model_stage.value,
+                    "is_verified": False,
+                    "rejection_reason": reason,
+                    "message": reason
+                }
+
+            if p_snap_path:
+                integrity = BaseCollector.verify_snapshot_integrity(str(p_snap_path), str(p_hash))
+                if not integrity.get("content_integrity_verified"):
+                    reason = f"正式训练准入门禁拒绝：血缘记录 #{idx} 快照文件哈希校验失败 ({integrity.get('reason')})。"
+                    self._reset_to_untrained(reason)
+                    return {
+                        "status": ModelTrainingStatus.MODEL_NOT_TRAINED.value,
+                        "model_stage": self.model_stage.value,
+                        "is_verified": False,
+                        "rejection_reason": reason,
+                        "message": reason
+                    }
 
         # 3. 独立检查每个预测期限的标签成熟度并拟合 (P0-02 分期限独立训练)
         if not labels_by_horizon:
@@ -620,7 +660,10 @@ class LightGBMGrowthForecaster:
                 }
             features = {}
 
-        missing_keys = [k for k in self.feature_names if k not in features or features[k] is None]
+        missing_keys = [
+            k for k in self.feature_names
+            if k not in features or features[k] is None or pd.isna(features[k])
+        ]
         if missing_keys and is_formal:
             return {
                 "status": "INSUFFICIENT_FEATURES",
@@ -635,15 +678,12 @@ class LightGBMGrowthForecaster:
                 "message": f"正式预测缺少关键输入特征 {missing_keys}，严禁使用经验默认值替代。"
             }
 
-        feat_vector = np.array([[
-            float(features.get("velocity_1y", 0.0)),
-            float(features.get("acceleration", 0.0)),
-            float(features.get("active_institutions", 0.0)),
-            float(features.get("github_momentum", 0.0)),
-            float(features.get("macro_multiplier", 1.0)),
-            float(features.get("entropy_score", 0.5)),
-            float(features.get("novelty_score", 0.5))
-        ]])
+        def _num_or_nan(val: Any) -> float:
+            if val is None or pd.isna(val):
+                return float(np.nan)
+            return float(val)
+
+        feat_vector = np.array([[_num_or_nan(features.get(k)) for k in self.feature_names]])
 
         predictions = {}
         for horizon in [1, 3, 5]:

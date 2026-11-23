@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from src.core.database import db_manager
-from src.core.types import PredictionStatus, ModelTrainingStatus, SimulationType
+from src.core.types import PredictionStatus, ModelTrainingStatus, ModelStage, SimulationType
 from src.macro.hmm_regime import MacroHMMRegimeModel
 from src.tech_discovery.inflection import InflectionDetector
 from src.diffusion.s_curve import SCurveDiffusionModel
@@ -118,20 +118,32 @@ class OpportunityPoolManager:
                         "stage_description": "历史样本不足4期或最新文献量为0，禁止虚构增长倍数"
                     }
 
-                # LightGBM 多维特征成长预测器 (使用当时实际可得指标构建，杜绝固定经验值冒充)
-                entropy_val = float(topic_metrics["entropy_score"].iloc[-1]) if (not topic_metrics.empty and "entropy_score" in topic_metrics and pd.notna(topic_metrics["entropy_score"].iloc[-1])) else 0.0
-                novelty_val = float(topic_metrics["novelty_score"].iloc[-1]) if (not topic_metrics.empty and "novelty_score" in topic_metrics and pd.notna(topic_metrics["novelty_score"].iloc[-1])) else 0.0
+                # LightGBM 多维特征成长预测器 (使用当时实际可得指标构建，缺失严格保留 None，杜绝默认值或非 PIT GitHub 泄露)
+                def _opt_float(col: str) -> Optional[float]:
+                    if topic_metrics.empty or col not in topic_metrics.columns:
+                        return None
+                    v = topic_metrics[col].iloc[-1]
+                    return None if (v is None or pd.isna(v)) else float(v)
+
+                github_mom: Optional[float] = _opt_float("github_stars")
+                if not topic_metrics.empty and "github_pit_eligible" in topic_metrics.columns:
+                    gh_elig = topic_metrics["github_pit_eligible"].iloc[-1]
+                    if cutoff_date < date.today() and (gh_elig is None or pd.isna(gh_elig) or not bool(gh_elig)):
+                        github_mom = None
 
                 lgbm_features = {
-                    "velocity_1y": float(inflection_res.get("latest_velocity_yoy", 0.0)),
-                    "acceleration": float(inflection_res.get("latest_acceleration", 0.0)),
-                    "active_institutions": float(topic_metrics["active_institutions"].iloc[-1]) if (not topic_metrics.empty and "active_institutions" in topic_metrics) else 0.0,
-                    "github_momentum": float(topic_metrics["github_stars"].iloc[-1]) if (not topic_metrics.empty and "github_stars" in topic_metrics) else 0.0,
-                    "macro_multiplier": float(latest_macro.get("macro_growth_multiplier", 1.0)),
-                    "entropy_score": entropy_val,
-                    "novelty_score": novelty_val
+                    "velocity_1y": float(inflection_res["latest_velocity_yoy"]) if (not topic_metrics.empty and inflection_res.get("latest_velocity_yoy") is not None) else None,
+                    "acceleration": float(inflection_res["latest_acceleration"]) if (not topic_metrics.empty and inflection_res.get("latest_acceleration") is not None) else None,
+                    "active_institutions": _opt_float("active_institutions"),
+                    "github_momentum": github_mom,
+                    "macro_multiplier": float(latest_macro["macro_growth_multiplier"]) if latest_macro.get("macro_growth_multiplier") is not None else None,
+                    "entropy_score": _opt_float("entropy_score"),
+                    "novelty_score": _opt_float("novelty_score"),
                 }
-                forecaster_pred = self.lgbm_forecaster.predict_growth(lgbm_features)
+                forecaster_pred = self.lgbm_forecaster.predict_growth(
+                    lgbm_features,
+                    require_complete_features=(self.lgbm_forecaster.model_stage == ModelStage.VERIFIED_PRODUCTION),
+                )
 
                 # 提取多期点估计 (若属于 UNVERIFIED_RESEARCH 实验模式，仅作为研究估计保留，绝不标记为正式已验证)
                 growth_mult = None
@@ -148,6 +160,7 @@ class OpportunityPoolManager:
 
                 diffusion_res = {
                     "status": forecaster_pred.get("status", "MODEL_NOT_TRAINED"),
+                    "is_verified": bool(forecaster_pred.get("is_verified", False)),
                     "growth_multiples": growth_multiples,
                     "current_penetration_pct": s_curve_res.get("current_penetration_pct"),
                     "stage_description": s_curve_res.get("stage_description")

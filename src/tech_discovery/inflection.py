@@ -40,6 +40,7 @@ class InflectionDetector:
     def analyze_tech_acceleration(self, topic_df: pd.DataFrame) -> Dict[str, Any]:
         """综合分析某技术主题的文献/代码一阶增速、二阶加速度与拐点状态"""
         df = topic_df.sort_values("as_of_date").copy()
+        df = df[pd.notna(df["papers_count"])].copy() if "papers_count" in df.columns else df.iloc[0:0]
         if len(df) < 3:
             return {
                 "status": "INSUFFICIENT_DATA",
@@ -48,9 +49,8 @@ class InflectionDetector:
                 "is_inflection_point": False
             }
 
-        papers = df["papers_count"].values
-        citations = df["citations_count"].values
-        years = np.array([d.year if hasattr(d, "year") else int(str(d)[:4]) for d in df["as_of_date"]])
+        papers = df["papers_count"].astype(float).values
+        citations = df["citations_count"].values if "citations_count" in df.columns else [None] * len(df)
 
         # 一阶差分 (速度)
         velocity = np.diff(papers)
@@ -75,6 +75,9 @@ class InflectionDetector:
         elif latest_velocity <= 0:
             stage = "成熟/关注回落期 (Cooling Down)"
 
+        latest_cit = citations[-1] if len(citations) > 0 else None
+        latest_inst = df["active_institutions"].iloc[-1] if "active_institutions" in df.columns else None
+
         return {
             "status": "VALIDATED",
             "stage": stage,
@@ -87,7 +90,7 @@ class InflectionDetector:
                 "papers_latest": int(papers[-1]),
                 "papers_3y_ago": int(papers[-4]) if len(papers) >= 4 else int(papers[0]),
                 "growth_multiple_3y": round(float(papers[-1] / max(papers[-4] if len(papers) >= 4 else papers[0], 1)), 2),
-                "citations_latest": int(citations[-1]),
-                "active_institutions": int(df["active_institutions"].iloc[-1])
+                "citations_latest": int(latest_cit) if pd.notna(latest_cit) else None,
+                "active_institutions": int(latest_inst) if pd.notna(latest_inst) else None
             }
         }

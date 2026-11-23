@@ -98,6 +98,21 @@ class DistressEventType(str, Enum):
     CENSORED_ACTIVE = "CENSORED_ACTIVE"                             # 正常存续/右删失 (未发生终结性违约事件)
 
 
+class HistoricalEligibilityStatus(str, Enum):
+    """历史数据点时序使用资格 (明确分离当前快照回顾统计与严格 Point-in-Time 历史版本)"""
+    STRICT_PIT_VERIFIED = "STRICT_PIT_VERIFIED"                             # 已核验历史快照及首次公开时间，可用于严格 PIT 回测
+    CURRENT_SNAPSHOT_HISTORICAL_STATS = "CURRENT_SNAPSHOT_HISTORICAL_STATS" # 当前查询返回的历史年份统计，允许描述性分析，不可直接冒充当年 PIT 快照
+    HISTORICAL_VINTAGE_UNAVAILABLE = "HISTORICAL_VINTAGE_UNAVAILABLE"       # 缺乏可核验历史快照或真实可获得时间，严格 PIT 回测拒绝使用
+    CURRENT_STATE_ONLY = "CURRENT_STATE_ONLY"                               # 仅反映当前查询时点生态状态 (如 GitHub 实时 Star)，禁止用于历史回测
+
+
+class InstitutionCountScope(str, Enum):
+    """学术机构统计覆盖口径 (严禁使用经验倍数将采样冒充完整统计)"""
+    COMPLETE_AGGREGATION = "COMPLETE_AGGREGATION"     # 来自完整聚合统计与稳定 ID 去重
+    SAMPLED_WORKS_ONLY = "SAMPLED_WORKS_ONLY"         # 仅来自部分采样论文作者机构去重，不得当作全量统计
+    UNAVAILABLE = "UNAVAILABLE"                       # 机构信息缺失或接口不可用
+
+
 class OOSValidationSample(BaseModel):
     """独立样本外验证单样本元数据结构 (P0-01 准入审计规范)"""
     sample_id: str
@@ -226,6 +241,31 @@ class ProvenanceMetadata(BaseModel):
     quality_status: DataQualityStatus = DataQualityStatus.VALIDATED
     data_version: str = "v1.0"
     raw_hash: Optional[str] = None
+    snapshot_id: Optional[str] = None
+    snapshot_path: Optional[str] = None
+    historical_eligibility: Optional[str] = None
+
+
+class RawSnapshotRecord(BaseModel):
+    """原始 API 响应快照与三层真实性分离记录 (内容完整性 / 来源真实性 / 历史可获得性)"""
+    snapshot_id: str
+    source_name: str
+    request_url: str
+    query_params: Dict[str, Any] = Field(default_factory=dict)
+    http_status: Optional[int] = None
+    ingested_at_utc: datetime
+    as_of_date: date
+    verified_first_available_at: Optional[datetime] = None
+    quality_status: DataQualityStatus = DataQualityStatus.UNVERIFIED
+    raw_sha256: Optional[str] = None
+    snapshot_path: Optional[str] = None
+    processor_code_version: str = "v1.2-p0-data-provenance"
+    historical_eligibility: HistoricalEligibilityStatus = HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE
+    error_message: Optional[str] = None
+    # 明确区分三类互相独立属性，禁止用 SHA-256 通过等同于“历史时点可信”
+    content_integrity_verified: bool = False
+    source_authenticity_status: str = "UNVERIFIED_EXTERNAL_API"
+    historical_availability_status: str = HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value
 
 
 class TechTopicEntity(BaseModel):

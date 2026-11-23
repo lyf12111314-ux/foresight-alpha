@@ -105,10 +105,28 @@ class PointInTimeBacktestEngine:
             forecaster.rejection_reason = f"历史时点 {cutoff_date.isoformat()} 尚无可获得的成熟训练样本。"
             return forecaster
 
-        # 检查特征列
-        for c in forecaster.feature_names:
-            if c not in hist_df.columns:
-                hist_df[c] = 0.0
+        # 仅在非正式实验模式下允许缺失列兼容；正式模式禁止用 0.0 填充缺失特征
+        missing_feature_cols = [c for c in forecaster.feature_names if c not in hist_df.columns]
+        if require_verified and missing_feature_cols:
+            forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+            forecaster.model_stage = ModelStage.UNTRAINED
+            forecaster.rejection_reason = (
+                f"HISTORICAL_VINTAGE_UNAVAILABLE: 正式历史模型缺少关键特征列 {missing_feature_cols}，严禁用 0.0 填补。"
+            )
+            return forecaster
+        for c in missing_feature_cols:
+            hist_df[c] = np.nan
+
+        if require_verified:
+            null_feat_mask = hist_df[forecaster.feature_names].isna().any(axis=1)
+            if null_feat_mask.any():
+                forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+                forecaster.model_stage = ModelStage.UNTRAINED
+                forecaster.rejection_reason = (
+                    "HISTORICAL_VINTAGE_UNAVAILABLE: 正式历史样本包含缺失特征值 (NULL/NaN)，"
+                    "严禁用默认常数补足正式训练。"
+                )
+                return forecaster
 
         # 分期限提取独立真实标签，严禁跨期限互相复制或替代 (P0-02 铁律)
         labels = {}
@@ -126,10 +144,80 @@ class PointInTimeBacktestEngine:
             return forecaster
 
         if require_verified:
-            provenance = [{"quality_status": "VERIFIED", "raw_hash": f"prov_hist_{i}"} for i in range(len(hist_df))]
+            # 严禁程序临时生成 {"quality_status": "VERIFIED", "raw_hash": f"prov_hist_{i}"} 伪造血缘
+            sample_ids = hist_df["sample_id"].tolist() if "sample_id" in hist_df.columns else []
+            if len(sample_ids) < len(hist_df):
+                forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+                forecaster.model_stage = ModelStage.UNTRAINED
+                forecaster.rejection_reason = "HISTORICAL_VINTAGE_UNAVAILABLE: 历史样本缺少 sample_id，无法关联真实原始血缘。"
+                return forecaster
+
+            provenance = []
+            for sid in sample_ids:
+                raw_df = db_manager.query_df(
+                    "SELECT record_id, source_name, published_at, quality_status, raw_hash, snapshot_id "
+                    "FROM raw_records WHERE record_id = ? LIMIT 1;",
+                    [str(sid)],
+                )
+                if raw_df.empty:
+                    forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+                    forecaster.model_stage = ModelStage.UNTRAINED
+                    forecaster.rejection_reason = f"HISTORICAL_VINTAGE_UNAVAILABLE: 样本 {sid} 在 raw_records 中缺少真实原始记录血缘。"
+                    return forecaster
+
+                raw_row = raw_df.iloc[0].to_dict()
+                snap_id = raw_row.get("snapshot_id")
+                if not snap_id or pd.isna(snap_id):
+                    forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+                    forecaster.model_stage = ModelStage.UNTRAINED
+                    forecaster.rejection_reason = f"HISTORICAL_VINTAGE_UNAVAILABLE: 样本 {sid} 未关联 raw_snapshots 原始快照。"
+                    return forecaster
+
+                snap_rec = db_manager.get_raw_snapshot(str(snap_id))
+                if not snap_rec:
+                    forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+                    forecaster.model_stage = ModelStage.UNTRAINED
+                    forecaster.rejection_reason = f"HISTORICAL_VINTAGE_UNAVAILABLE: 未找到快照 {snap_id} 存证。"
+                    return forecaster
+
+                integrity = db_manager.verify_snapshot_file_integrity(str(snap_id))
+                if not integrity.get("verified"):
+                    forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+                    forecaster.model_stage = ModelStage.UNTRAINED
+                    forecaster.rejection_reason = (
+                        f"HISTORICAL_VINTAGE_UNAVAILABLE: 快照 {snap_id} 内容完整性校验失败 ({integrity.get('reason')})。"
+                    )
+                    return forecaster
+
+                v_first = snap_rec.get("verified_first_available_at")
+                h_elig = snap_rec.get("historical_eligibility")
+                if (
+                    h_elig != "STRICT_PIT_VERIFIED"
+                    or v_first is None
+                    or pd.isna(v_first)
+                    or pd.to_datetime(v_first).date() > cutoff_date
+                ):
+                    forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+                    forecaster.model_stage = ModelStage.UNTRAINED
+                    forecaster.rejection_reason = (
+                        f"HISTORICAL_VINTAGE_UNAVAILABLE: 样本 {sid} 历史资格={h_elig}，"
+                        f"缺少截断日 {cutoff_date.isoformat()} 前可核验的历史版本证明。"
+                    )
+                    return forecaster
+
+                provenance.append({
+                    "record_id": raw_row.get("record_id"),
+                    "quality_status": raw_row.get("quality_status"),
+                    "raw_hash": raw_row.get("raw_hash"),
+                    "snapshot_id": str(snap_id),
+                    "snapshot_path": snap_rec.get("snapshot_path"),
+                    "historical_eligibility": h_elig,
+                })
+
             forecaster.fit_verified(
                 features=hist_df[forecaster.feature_names],
                 labels_by_horizon=labels,
+                quality_status=hist_df["quality_status"].iloc[0] if "quality_status" in hist_df.columns else "UNVERIFIED",
                 provenance_records=provenance,
                 dataset_version=f"pit_hist_verified_{cutoff_date.strftime('%Y%m%d')}"
             )
