@@ -113,6 +113,13 @@ class InstitutionCountScope(str, Enum):
     UNAVAILABLE = "UNAVAILABLE"                       # 机构信息缺失或接口不可用
 
 
+class CitationCountScope(str, Enum):
+    """学术引用统计覆盖口径 (严禁将按当前引用排序采样得到的合计冒充领域完整引用量)"""
+    COMPLETE_DOMAIN_TOTAL = "COMPLETE_DOMAIN_TOTAL"   # 领域全部论文均有按年截止引用明细并完整汇总
+    SAMPLED_TOP_CITED_BIASED = "SAMPLED_TOP_CITED_BIASED"  # 仅来自按当下 cited_by_count 排序采样论文，存在选择偏差与覆盖缺口
+    UNAVAILABLE = "UNAVAILABLE"                       # 无法获取合规的截止日期前引用数据
+
+
 class OOSValidationSample(BaseModel):
     """独立样本外验证单样本元数据结构 (P0-01 准入审计规范)"""
     sample_id: str
@@ -262,6 +269,7 @@ class RawSnapshotRecord(BaseModel):
     processor_code_version: str = "v1.2-p0-data-provenance"
     historical_eligibility: HistoricalEligibilityStatus = HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE
     error_message: Optional[str] = None
+    vintage_evidence_source: Optional[str] = None
     # 明确区分三类互相独立属性，禁止用 SHA-256 通过等同于“历史时点可信”
     content_integrity_verified: bool = False
     source_authenticity_status: str = "UNVERIFIED_EXTERNAL_API"

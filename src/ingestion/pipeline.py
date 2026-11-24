@@ -24,6 +24,28 @@ class IngestionPipeline:
         self.enterprise = EnterpriseCollector()
         self.tech_dataset = HistoricalTechDatasetCollector()
 
+    @staticmethod
+    def _append_raw_record(conn, prov: Dict[str, Any], raw_payload: Any, snapshot_id: Any = None) -> str:
+        """以不可变版本模式追加 raw_records，保留同一来源同一主题同一年度多次采集的历史版本。"""
+        snap = snapshot_id if snapshot_id is not None else prov.get("snapshot_id")
+        return db_manager.append_raw_record(
+            {
+                "record_id": prov["record_id"],
+                "logical_record_id": prov.get("logical_record_id", prov["record_id"]),
+                "source_name": prov["source_name"],
+                "source_url": prov["source_url"],
+                "as_of_date": prov["as_of_date"],
+                "published_at": prov["published_at"],
+                "ingested_at": prov["ingested_at"],
+                "quality_status": prov["quality_status"],
+                "data_version": prov["data_version"],
+                "raw_hash": prov["raw_hash"],
+                "payload": raw_payload,
+                "snapshot_id": snap,
+            },
+            conn=conn,
+        )
+
     def ingest_distress_cohort(self) -> int:
         """入库企业违约与存续历史真实队列 (P1-01 训练底座)"""
         records = self.enterprise.get_historical_distress_cohort()
@@ -32,16 +54,7 @@ class IngestionPipeline:
         try:
             for row in records:
                 prov = row["provenance"]
-                conn.execute("""
-                    INSERT OR REPLACE INTO raw_records 
-                    (record_id, source_name, source_url, as_of_date, published_at, ingested_at, quality_status, data_version, raw_hash, payload)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """, [
-                    prov["record_id"], prov["source_name"], prov["source_url"],
-                    prov["as_of_date"], prov["published_at"], prov["ingested_at"],
-                    prov["quality_status"], prov["data_version"], prov["raw_hash"],
-                    row["raw_payload"]
-                ])
+                self._append_raw_record(conn, prov, row["raw_payload"])
                 conn.execute("""
                     INSERT OR REPLACE INTO company_distress_cohort
                     (company_id, company_name, industry_sector, duration_months, observation_window_months, is_distressed, distress_type, distress_event_type, event_date, published_at, cash_burn_months, debt_ratio, gross_margin, competitor_count, is_covariate_audited, official_announcement_id, source_url, quality_status)
@@ -68,16 +81,7 @@ class IngestionPipeline:
         try:
             for s in samples:
                 prov = s["provenance"]
-                conn.execute("""
-                    INSERT OR REPLACE INTO raw_records 
-                    (record_id, source_name, source_url, as_of_date, published_at, ingested_at, quality_status, data_version, raw_hash, payload)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """, [
-                    prov["record_id"], prov["source_name"], prov["source_url"],
-                    prov["as_of_date"], prov["published_at"], prov["ingested_at"],
-                    prov["quality_status"], prov["data_version"], prov["raw_hash"],
-                    s["raw_payload"]
-                ])
+                self._append_raw_record(conn, prov, s["raw_payload"])
                 conn.execute("""
                     INSERT OR REPLACE INTO tech_training_samples
                     (sample_id, topic_id, base_date, published_at, feature_published_at, feature_ingested_at, velocity_1y, acceleration, active_institutions, github_momentum, macro_multiplier, entropy_score, novelty_score, label_1y_period_end, label_1y_status, target_1y, label_3y_period_end, label_3y_status, target_3y, label_5y_period_end, label_5y_status, target_5y, quality_status)
@@ -121,17 +125,8 @@ class IngestionPipeline:
         try:
             for item in all_macro:
                 prov = item["provenance"]
-                # 写入 raw_records 归档表
-                conn.execute("""
-                    INSERT OR REPLACE INTO raw_records 
-                    (record_id, source_name, source_url, as_of_date, published_at, ingested_at, quality_status, data_version, raw_hash, payload)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """, [
-                    prov["record_id"], prov["source_name"], prov["source_url"],
-                    prov["as_of_date"], prov["published_at"], prov["ingested_at"],
-                    prov["quality_status"], prov["data_version"], prov["raw_hash"],
-                    item["raw_payload"]
-                ])
+                # 写入不可变 raw_records 归档表
+                self._append_raw_record(conn, prov, item["raw_payload"])
                 stats["raw_records"] += 1
 
                 # 写入 clean macro 表
@@ -153,16 +148,7 @@ class IngestionPipeline:
             fin_records = self.enterprise.get_core_enterprise_financials()
             for fin in fin_records:
                 prov = fin["provenance"]
-                conn.execute("""
-                    INSERT OR REPLACE INTO raw_records 
-                    (record_id, source_name, source_url, as_of_date, published_at, ingested_at, quality_status, data_version, raw_hash, payload)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """, [
-                    prov["record_id"], prov["source_name"], prov["source_url"],
-                    prov["as_of_date"], prov["published_at"], prov["ingested_at"],
-                    prov["quality_status"], prov["data_version"], prov["raw_hash"],
-                    fin["raw_payload"]
-                ])
+                self._append_raw_record(conn, prov, fin["raw_payload"])
                 stats["raw_records"] += 1
 
                 conn.execute("""
@@ -186,16 +172,7 @@ class IngestionPipeline:
             distress_cohort = self.enterprise.get_historical_distress_cohort()
             for row in distress_cohort:
                 prov = row["provenance"]
-                conn.execute("""
-                    INSERT OR REPLACE INTO raw_records 
-                    (record_id, source_name, source_url, as_of_date, published_at, ingested_at, quality_status, data_version, raw_hash, payload)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """, [
-                    prov["record_id"], prov["source_name"], prov["source_url"],
-                    prov["as_of_date"], prov["published_at"], prov["ingested_at"],
-                    prov["quality_status"], prov["data_version"], prov["raw_hash"],
-                    row["raw_payload"]
-                ])
+                self._append_raw_record(conn, prov, row["raw_payload"])
                 stats["raw_records"] += 1
 
                 conn.execute("""
@@ -230,24 +207,22 @@ class IngestionPipeline:
             for topic_id, query_str in topics_to_track:
                 alex_records = self.openalex.fetch_topic_research_trends(query_str, 2018, 2024)
                 for rec in alex_records:
-                    if rec.get("snapshot_meta"):
-                        db_manager.save_raw_snapshot(rec["snapshot_meta"], conn=conn)
+                    snap_metas = rec.get("snapshot_metas") or (
+                        [rec["snapshot_meta"]] if rec.get("snapshot_meta") else []
+                    )
+                    seen_snap_ids = set()
+                    for smeta in snap_metas:
+                        sid = smeta.get("snapshot_id")
+                        if sid and sid not in seen_snap_ids:
+                            db_manager.save_raw_snapshot(smeta, conn=conn)
+                            seen_snap_ids.add(sid)
 
                     # 采集失败绝不生成 papers_count=0 的正常观测记录
                     if rec.get("status") != "OK" or rec.get("papers_count") is None:
                         continue
 
                     prov = rec["provenance"]
-                    conn.execute("""
-                        INSERT OR REPLACE INTO raw_records 
-                        (record_id, source_name, source_url, as_of_date, published_at, ingested_at, quality_status, data_version, raw_hash, payload, snapshot_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """, [
-                        prov["record_id"], prov["source_name"], prov["source_url"],
-                        prov["as_of_date"], prov["published_at"], prov["ingested_at"],
-                        prov["quality_status"], prov["data_version"], prov["raw_hash"],
-                        rec["raw_payload"], rec.get("snapshot_id")
-                    ])
+                    self._append_raw_record(conn, prov, rec["raw_payload"], snapshot_id=rec.get("snapshot_id"))
                     stats["raw_records"] += 1
 
                     # 仅在完整真实机构数和论文数均可用时计算指标；缺失则保留 NULL，绝不用经验公式或年份衰减估算
@@ -258,19 +233,27 @@ class IngestionPipeline:
                         if (inst_cnt is not None and papers_cnt > 0)
                         else None
                     )
+                    lineage_json = json.dumps(
+                        rec.get("feature_lineage", {}), ensure_ascii=False, sort_keys=True
+                    )
 
                     conn.execute("""
                         INSERT OR REPLACE INTO tech_metrics
-                        (topic_id, as_of_date, published_at, papers_count, citations_count, active_institutions, github_stars, github_forks, commit_velocity, entropy_score, novelty_score, snapshot_id, historical_eligibility, institution_count_scope, citations_cutoff_year, github_pit_eligible)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        (topic_id, as_of_date, published_at, papers_count, citations_count, sampled_citations_count, citation_count_scope, active_institutions, sampled_institutions_count, github_stars, github_forks, commit_velocity, entropy_score, novelty_score, snapshot_id, historical_eligibility, institution_count_scope, citations_cutoff_year, feature_lineage_json, github_pit_eligible)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """, [
                         topic_id, rec["as_of_date"], rec["published_at"],
-                        papers_cnt, rec.get("citations_count"), inst_cnt,
+                        papers_cnt, rec.get("citations_count"),
+                        rec.get("sampled_citations_count"),
+                        rec.get("citation_count_scope"),
+                        inst_cnt,
+                        rec.get("sampled_institutions_count"),
                         None, None, None, entropy, None,
                         rec.get("snapshot_id"),
                         rec.get("historical_eligibility"),
                         rec.get("institution_count_scope"),
                         rec.get("citations_cutoff_year"),
+                        lineage_json,
                         False,
                     ])
                     stats["tech_metrics"] += 1
@@ -294,16 +277,7 @@ class IngestionPipeline:
                         db_manager.save_raw_snapshot(r["snapshot_meta"], conn=conn)
                         saved_gh_snaps.add(r["snapshot_meta"]["snapshot_id"])
                     prov = r["provenance"]
-                    conn.execute("""
-                        INSERT OR REPLACE INTO raw_records 
-                        (record_id, source_name, source_url, as_of_date, published_at, ingested_at, quality_status, data_version, raw_hash, payload, snapshot_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """, [
-                        prov["record_id"], prov["source_name"], prov["source_url"],
-                        prov["as_of_date"], prov["published_at"], prov["ingested_at"],
-                        prov["quality_status"], prov["data_version"], prov["raw_hash"],
-                        r["raw_payload"], prov.get("snapshot_id")
-                    ])
+                    self._append_raw_record(conn, prov, r["raw_payload"], snapshot_id=prov.get("snapshot_id"))
                     stats["raw_records"] += 1
 
                 # 仅作为当前查询时点生态观察写入（明确标为 github_pit_eligible=FALSE），无仓库返回时绝不写 0
@@ -323,16 +297,7 @@ class IngestionPipeline:
             tech_samples = self.tech_dataset.get_historical_tech_training_samples()
             for s in tech_samples:
                 prov = s["provenance"]
-                conn.execute("""
-                    INSERT OR REPLACE INTO raw_records 
-                    (record_id, source_name, source_url, as_of_date, published_at, ingested_at, quality_status, data_version, raw_hash, payload)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """, [
-                    prov["record_id"], prov["source_name"], prov["source_url"],
-                    prov["as_of_date"], prov["published_at"], prov["ingested_at"],
-                    prov["quality_status"], prov["data_version"], prov["raw_hash"],
-                    s["raw_payload"]
-                ])
+                self._append_raw_record(conn, prov, s["raw_payload"])
                 stats["raw_records"] += 1
 
                 conn.execute("""

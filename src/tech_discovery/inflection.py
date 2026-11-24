@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
-from src.core.types import AlertRecord, ObjectLevel
+from src.core.types import AlertRecord, ObjectLevel, CitationCountScope
 
 
 class InflectionDetector:
@@ -77,6 +77,15 @@ class InflectionDetector:
 
         latest_cit = citations[-1] if len(citations) > 0 else None
         latest_inst = df["active_institutions"].iloc[-1] if "active_institutions" in df.columns else None
+        cit_scope = df["citation_count_scope"].iloc[-1] if "citation_count_scope" in df.columns else None
+        sampled_cit = df["sampled_citations_count"].iloc[-1] if "sampled_citations_count" in df.columns else None
+        scope_str = str(cit_scope) if (cit_scope is not None and pd.notna(cit_scope)) else None
+
+        # 严禁将仅来自采样作品的 sampled_citations_count 作为全领域引用总量输出
+        if scope_str is not None and scope_str != CitationCountScope.COMPLETE_DOMAIN_TOTAL.value:
+            citations_latest = None
+        else:
+            citations_latest = int(latest_cit) if pd.notna(latest_cit) else None
 
         return {
             "status": "VALIDATED",
@@ -90,7 +99,9 @@ class InflectionDetector:
                 "papers_latest": int(papers[-1]),
                 "papers_3y_ago": int(papers[-4]) if len(papers) >= 4 else int(papers[0]),
                 "growth_multiple_3y": round(float(papers[-1] / max(papers[-4] if len(papers) >= 4 else papers[0], 1)), 2),
-                "citations_latest": int(latest_cit) if pd.notna(latest_cit) else None,
+                "citations_latest": citations_latest,
+                "sampled_citations_latest": int(sampled_cit) if (sampled_cit is not None and pd.notna(sampled_cit)) else None,
+                "citation_count_scope": scope_str,
                 "active_institutions": int(latest_inst) if pd.notna(latest_inst) else None
             }
         }

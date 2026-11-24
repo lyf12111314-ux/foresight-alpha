@@ -6,6 +6,7 @@
 import os
 import json
 import hashlib
+import uuid
 import duckdb
 import pandas as pd
 from datetime import datetime, date
@@ -51,11 +52,14 @@ class DatabaseManager:
                     quality_status VARCHAR NOT NULL,
                     data_version VARCHAR NOT NULL,
                     raw_hash VARCHAR,
-                    payload JSON
+                    payload JSON,
+                    snapshot_id VARCHAR,
+                    logical_record_id VARCHAR,
+                    ingestion_version INTEGER DEFAULT 1
                 );
             """)
 
-            # 2. 技术主题时序指标 (学术论文、开源指标、新颖度)
+            # 2. 技术主题时序指标 (学术论文、开源指标、新颖度与完整特征溯源)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS tech_metrics (
                     topic_id VARCHAR NOT NULL,
@@ -69,6 +73,15 @@ class DatabaseManager:
                     commit_velocity DOUBLE DEFAULT 0.0,
                     entropy_score DOUBLE DEFAULT 0.0,
                     novelty_score DOUBLE DEFAULT 0.0,
+                    snapshot_id VARCHAR,
+                    historical_eligibility VARCHAR,
+                    institution_count_scope VARCHAR,
+                    citations_cutoff_year INTEGER,
+                    github_pit_eligible BOOLEAN,
+                    sampled_citations_count BIGINT,
+                    citation_count_scope VARCHAR,
+                    sampled_institutions_count INTEGER,
+                    feature_lineage_json JSON,
                     PRIMARY KEY (topic_id, as_of_date)
                 );
             """)
@@ -247,6 +260,7 @@ class DatabaseManager:
                     processor_code_version VARCHAR NOT NULL,
                     historical_eligibility VARCHAR NOT NULL,
                     error_message VARCHAR,
+                    vintage_evidence_source VARCHAR,
                     content_integrity_verified BOOLEAN DEFAULT FALSE,
                     source_authenticity_status VARCHAR,
                     historical_availability_status VARCHAR
@@ -405,17 +419,37 @@ class DatabaseManager:
                     processor_code_version VARCHAR NOT NULL,
                     historical_eligibility VARCHAR NOT NULL,
                     error_message VARCHAR,
+                    vintage_evidence_source VARCHAR,
                     content_integrity_verified BOOLEAN DEFAULT FALSE,
                     source_authenticity_status VARCHAR,
                     historical_availability_status VARCHAR
                 );
             """)
             for col, dtype in [
+                ("vintage_evidence_source", "VARCHAR"),
+            ]:
+                m_id = f"mig_raw_snapshots_add_{col}"
+                try:
+                    conn.execute(f"ALTER TABLE raw_snapshots ADD COLUMN IF NOT EXISTS {col} {dtype};")
+                    _record_migration(m_id, "v1.2-p0", f"Add column {col} to raw_snapshots", "SUCCESS")
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "already exists" in err_str:
+                        _record_migration(m_id, "v1.2-p0", f"Column {col} already exists", "ALREADY_APPLIED", str(e))
+                    else:
+                        _record_migration(m_id, "v1.2-p0", f"Add column {col} failed", "FAILED", str(e))
+                        raise RuntimeError(f"Database migration failed adding column {col} to raw_snapshots: {e}")
+
+            for col, dtype in [
                 ("snapshot_id", "VARCHAR"),
                 ("historical_eligibility", "VARCHAR"),
                 ("institution_count_scope", "VARCHAR"),
                 ("citations_cutoff_year", "INTEGER"),
-                ("github_pit_eligible", "BOOLEAN")
+                ("github_pit_eligible", "BOOLEAN"),
+                ("sampled_citations_count", "BIGINT"),
+                ("citation_count_scope", "VARCHAR"),
+                ("sampled_institutions_count", "INTEGER"),
+                ("feature_lineage_json", "JSON"),
             ]:
                 m_id = f"mig_tech_metrics_add_{col}"
                 try:
@@ -429,16 +463,22 @@ class DatabaseManager:
                         _record_migration(m_id, "v1.2-p0", f"Add column {col} failed", "FAILED", str(e))
                         raise RuntimeError(f"Database migration failed adding column {col} to tech_metrics: {e}")
 
-            try:
-                conn.execute("ALTER TABLE raw_records ADD COLUMN IF NOT EXISTS snapshot_id VARCHAR;")
-                _record_migration("mig_raw_records_add_snapshot_id", "v1.2-p0", "Add column snapshot_id to raw_records", "SUCCESS")
-            except Exception as e:
-                err_str = str(e).lower()
-                if "already exists" in err_str:
-                    _record_migration("mig_raw_records_add_snapshot_id", "v1.2-p0", "Column snapshot_id already exists", "ALREADY_APPLIED", str(e))
-                else:
-                    _record_migration("mig_raw_records_add_snapshot_id", "v1.2-p0", "Add column snapshot_id failed", "FAILED", str(e))
-                    raise RuntimeError(f"Database migration failed adding snapshot_id to raw_records: {e}")
+            for col, dtype in [
+                ("snapshot_id", "VARCHAR"),
+                ("logical_record_id", "VARCHAR"),
+                ("ingestion_version", "INTEGER DEFAULT 1"),
+            ]:
+                m_id = f"mig_raw_records_add_{col}"
+                try:
+                    conn.execute(f"ALTER TABLE raw_records ADD COLUMN IF NOT EXISTS {col} {dtype};")
+                    _record_migration(m_id, "v1.2-p0", f"Add column {col} to raw_records", "SUCCESS")
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "already exists" in err_str:
+                        _record_migration(m_id, "v1.2-p0", f"Column {col} already exists", "ALREADY_APPLIED", str(e))
+                    else:
+                        _record_migration(m_id, "v1.2-p0", f"Add column {col} failed", "FAILED", str(e))
+                        raise RuntimeError(f"Database migration failed adding {col} to raw_records: {e}")
 
             # 5. 迁移后模式完整性校验 (Post-Migration Schema Integrity Check)
             self._verify_post_migration_integrity(conn)
@@ -512,9 +552,9 @@ class DatabaseManager:
                     snapshot_id, source_name, request_url, query_params, http_status,
                     ingested_at_utc, as_of_date, verified_first_available_at, quality_status,
                     raw_sha256, snapshot_path, processor_code_version, historical_eligibility,
-                    error_message, content_integrity_verified, source_authenticity_status,
-                    historical_availability_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    error_message, vintage_evidence_source, content_integrity_verified,
+                    source_authenticity_status, historical_availability_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(snapshot_id) DO NOTHING;
             """, [
                 snapshot_meta["snapshot_id"],
@@ -531,6 +571,7 @@ class DatabaseManager:
                 snapshot_meta.get("processor_code_version", "v1.2-p0-data-provenance"),
                 snapshot_meta.get("historical_eligibility", "HISTORICAL_VINTAGE_UNAVAILABLE"),
                 snapshot_meta.get("error_message"),
+                snapshot_meta.get("vintage_evidence_source"),
                 bool(snapshot_meta.get("content_integrity_verified", False)),
                 snapshot_meta.get("source_authenticity_status", "UNVERIFIED_EXTERNAL_API"),
                 snapshot_meta.get("historical_availability_status", "HISTORICAL_VINTAGE_UNAVAILABLE"),
@@ -538,6 +579,109 @@ class DatabaseManager:
         finally:
             if close_conn:
                 conn.close()
+
+    def append_raw_record(self, record: Dict[str, Any], conn=None) -> str:
+        """不可变追加原始采集记录至 raw_records (严禁使用 INSERT OR REPLACE 覆盖历史采集事件)。
+
+        兼容规则：
+        - 首次出现 logical_record_id 时以 record_id = logical_record_id, ingestion_version = 1 入库，完全兼容现有按 record_id 查询；
+        - 同一逻辑记录再次采集时保留旧版本，新增版本号与唯一 record_id 独立落盘。
+        """
+        close_conn = False
+        if conn is None:
+            conn = self.get_connection()
+            close_conn = True
+        try:
+            logical_id = str(record.get("logical_record_id") or record["record_id"])
+            existing = conn.execute(
+                """
+                SELECT record_id, COALESCE(ingestion_version, 1)
+                FROM raw_records
+                WHERE logical_record_id = ? OR record_id = ?;
+                """,
+                [logical_id, logical_id],
+            ).fetchall()
+
+            if not existing:
+                assigned_id = logical_id
+                version_num = 1
+            else:
+                max_ver = max(int(r[1]) for r in existing)
+                version_num = max_ver + 1
+                snap_ref = record.get("snapshot_id") or record.get("raw_hash") or uuid.uuid4().hex
+                tag = str(snap_ref)[-8:] if str(snap_ref).startswith(("OPENALEX_", "GITHUB_", "openalex_")) else str(snap_ref)[:8]
+                assigned_id = f"{logical_id}__v{version_num}__{tag}"
+                # 确保高并发或同内容同秒多次重采下 record_id 唯一
+                collision = conn.execute("SELECT 1 FROM raw_records WHERE record_id = ? LIMIT 1;", [assigned_id]).fetchone()
+                if collision:
+                    assigned_id = f"{logical_id}__v{version_num}__{uuid.uuid4().hex[:8]}"
+
+            payload_val = record.get("payload")
+            if payload_val is not None and not isinstance(payload_val, str):
+                payload_val = json.dumps(payload_val, ensure_ascii=False, sort_keys=True, default=str)
+
+            conn.execute("""
+                INSERT INTO raw_records (
+                    record_id, source_name, source_url, as_of_date, published_at,
+                    ingested_at, quality_status, data_version, raw_hash, payload,
+                    snapshot_id, logical_record_id, ingestion_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, [
+                assigned_id,
+                record["source_name"],
+                record.get("source_url"),
+                record["as_of_date"],
+                record["published_at"],
+                record["ingested_at"],
+                record["quality_status"],
+                record.get("data_version", "v1.2"),
+                record.get("raw_hash"),
+                payload_val,
+                record.get("snapshot_id"),
+                logical_id,
+                version_num,
+            ])
+            return assigned_id
+        finally:
+            if close_conn:
+                conn.close()
+
+    def get_raw_record_versions(
+        self,
+        logical_record_id: str,
+        cutoff_date: Optional[date] = None,
+    ) -> pd.DataFrame:
+        """按时间升序检索某一逻辑记录的全部不可变采集版本 (支持截止日期 PIT 过滤)"""
+        if cutoff_date is None:
+            return self.query_df(
+                """
+                SELECT * FROM raw_records
+                WHERE logical_record_id = ? OR record_id = ?
+                ORDER BY COALESCE(ingestion_version, 1) ASC, ingested_at ASC;
+                """,
+                [logical_record_id, logical_record_id],
+            )
+        cutoff_ts = self._resolve_cutoff_ts(cutoff_date)
+        return self.query_df(
+            """
+            SELECT * FROM raw_records
+            WHERE (logical_record_id = ? OR record_id = ?)
+              AND published_at IS NOT NULL AND published_at <= ?
+            ORDER BY COALESCE(ingestion_version, 1) ASC, ingested_at ASC;
+            """,
+            [logical_record_id, logical_record_id, cutoff_ts],
+        )
+
+    def get_latest_raw_record(
+        self,
+        logical_record_id: str,
+        cutoff_date: Optional[date] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """获取指定截止日(或当前)最新的不可变采集记录"""
+        df = self.get_raw_record_versions(logical_record_id, cutoff_date=cutoff_date)
+        if df.empty:
+            return None
+        return df.iloc[-1].to_dict()
 
     def get_raw_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
         """按 snapshot_id 查询原始快照审计记录"""
@@ -576,6 +720,17 @@ class DatabaseManager:
             "verified_first_available_at": rec.get("verified_first_available_at")
         }
 
+    @staticmethod
+    def _resolve_cutoff_ts(cutoff_date: date) -> datetime:
+        if isinstance(cutoff_date, datetime):
+            return cutoff_date
+        cutoff_ts = datetime(cutoff_date.year, cutoff_date.month, cutoff_date.day, 23, 59, 59, 999999)
+        if cutoff_date == date.today():
+            utc_now = datetime.utcnow()
+            if utc_now > cutoff_ts:
+                cutoff_ts = utc_now
+        return cutoff_ts
+
     def query_point_in_time(
         self,
         table_name: str,
@@ -590,14 +745,7 @@ class DatabaseManager:
         彻底防止未来信息泄露 (Lookahead Bias)。
         若 require_verified_timestamp=True，仅允许经过时间验证且发布时间可信的数据参与计算。
         """
-        if isinstance(cutoff_date, datetime):
-            cutoff_ts = cutoff_date
-        else:
-            cutoff_ts = datetime(cutoff_date.year, cutoff_date.month, cutoff_date.day, 23, 59, 59, 999999)
-            if cutoff_date == date.today():
-                utc_now = datetime.utcnow()
-                if utc_now > cutoff_ts:
-                    cutoff_ts = utc_now
+        cutoff_ts = self._resolve_cutoff_ts(cutoff_date)
 
         sql = f"""
             SELECT * FROM {table_name}

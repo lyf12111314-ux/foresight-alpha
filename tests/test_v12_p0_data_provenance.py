@@ -10,6 +10,7 @@ from datetime import date, datetime, timezone
 from unittest.mock import MagicMock
 
 import numpy as np
+import pandas as pd
 import pytest
 import requests
 
@@ -19,6 +20,7 @@ import src.decision_engine.opportunity_pool as opp_pool
 import src.ingestion.pipeline as ing_pipe
 from src.core.database import DatabaseManager
 from src.core.types import (
+    CitationCountScope,
     DataQualityStatus,
     HistoricalEligibilityStatus,
     InstitutionCountScope,
@@ -37,6 +39,7 @@ from src.ingestion.github import GithubCollector
 from src.ingestion.openalex import OpenAlexCollector
 from src.ingestion.pipeline import IngestionPipeline
 from src.backtest.engine import PointInTimeBacktestEngine
+from src.tech_discovery.inflection import InflectionDetector
 
 
 def _mock_json_response(payload: dict, status_code: int = 200) -> MagicMock:
@@ -117,11 +120,14 @@ def test_a_future_citations_filtered_and_missing_counts_never_zeroed(tmp_path, m
 
     assert rec["status"] == "OK"
     assert rec["papers_count"] == 1807
-    # 严禁使用 2528 + 500；仅取 2020 年真实未未来泄露部分 107
-    assert rec["citations_count"] == 107
+    # 严禁将仅来自 2 篇高被引样本的 107 当作全领域 1807 篇总引用；仅写入 sampled_citations_count 并标注采样口径
+    assert rec["citations_count"] is None
+    assert rec["sampled_citations_count"] == 107
+    assert rec["citation_count_scope"] == CitationCountScope.SAMPLED_TOP_CITED_BIASED.value
     assert rec["citations_cutoff_year"] == 2020
     assert rec["works_with_pit_counts"] == 1
     assert rec["works_missing_pit_counts"] == 1
+    assert set(rec["feature_lineage"].keys()) >= {"papers_count", "citations_count", "active_institutions"}
 
     # 机构数去重严格为 3 (I1, I2, ror/03)，因 group_by 触及 200 上限且仅部分采样，绝不启用 *12/*0.15 估算，完整口径字段为 None
     assert rec["sampled_institutions_count"] == 3
@@ -577,3 +583,327 @@ def test_p1_same_day_pit_visibility_and_pipeline_snapshot_consistency(tmp_path, 
     finally:
         conn.close()
     assert temp_db.verify_snapshot_file_integrity(repos[0]["snapshot_id"])["verified"] is True
+
+
+
+# =============================================================================
+# 测试 H (PR #7 P0 整改)：伪造历史状态/时间/64位哈希不得通过 STRICT PIT 核验，真实库内归档快照可通过
+# =============================================================================
+
+def test_h_forged_pit_eligibility_rejected_and_db_backed_verified_accepted(tmp_path, monkeypatch):
+    temp_db = _setup_isolated_db(tmp_path, monkeypatch)
+    snap_dir = str(tmp_path / "h_snaps")
+    collector = OpenAlexCollector(snapshot_dir=snap_dir)
+
+    # H1: 调用方直接自填 STRICT_PIT_VERIFIED + 历史发布时间 + 伪造64位SHA256 + 未登记 snapshot_id，必须拒绝
+    forged_unregistered = {
+        "snapshot_id": "OA_FORGED_UNREGISTERED_2020",
+        "as_of_date": date(2020, 12, 31),
+        "verified_first_available_at": datetime(2020, 12, 31, 12, 0, 0),
+        "historical_eligibility": HistoricalEligibilityStatus.STRICT_PIT_VERIFIED.value,
+        "source_authenticity_status": "VERIFIED_HISTORICAL_ARCHIVE",
+        "vintage_evidence_source": "forged_caller_claim",
+        "raw_sha256": "f" * 64,
+    }
+    res_h1 = collector.evaluate_historical_pit_eligibility(forged_unregistered, cutoff_date=date(2020, 12, 31), db=temp_db)
+    assert res_h1["eligible"] is False
+    assert res_h1["status"] == HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value
+
+    # H2: 仅普通当下 HTTP 快照在 raw_snapshots 登记，即使调用方伪传 STRICT_PIT_VERIFIED 与 2020 时间，仍必须拒绝
+    raw_bytes = json.dumps({"meta": {"count": 1807}, "group_by": [{"key": "2020", "count": 1807}]}).encode("utf-8")
+    current_meta = collector.save_raw_response_snapshot(
+        snapshot_dir=snap_dir,
+        request_url="https://api.openalex.org/works",
+        query_params={"search": '"solid-state battery"', "filter": "publication_year:2020", "group_by": "publication_year"},
+        http_status=200,
+        raw_bytes=raw_bytes,
+        as_of_date=date(2020, 12, 31),
+        verified_first_available_at=None,
+        quality_status=DataQualityStatus.UNVERIFIED,
+        historical_eligibility=HistoricalEligibilityStatus.CURRENT_SNAPSHOT_HISTORICAL_STATS,
+        file_prefix="oa_2020",
+    )
+    temp_db.save_raw_snapshot(current_meta)
+
+    forged_override = {
+        "snapshot_id": current_meta["snapshot_id"],
+        "as_of_date": date(2020, 12, 31),
+        "verified_first_available_at": datetime(2020, 12, 31, 0, 0, 0),
+        "historical_eligibility": HistoricalEligibilityStatus.STRICT_PIT_VERIFIED.value,
+        "raw_sha256": current_meta["raw_sha256"],
+    }
+    res_h2 = collector.evaluate_historical_pit_eligibility(forged_override, cutoff_date=date(2020, 12, 31), db=temp_db)
+    assert res_h2["eligible"] is False
+    assert res_h2["status"] == HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value
+
+    # H3: 库中即便已登记历史归档记录，但若磁盘文件遭篡改或证据来源无效 ("self")，仍必须拒绝
+    tampered_archive = collector.save_raw_response_snapshot(
+        snapshot_dir=snap_dir,
+        request_url="https://archive.example.org/openalex/2020",
+        query_params={"year": 2020},
+        http_status=200,
+        raw_bytes=raw_bytes,
+        as_of_date=date(2020, 12, 31),
+        verified_first_available_at=datetime(2020, 12, 31, 8, 0, 0),
+        quality_status=DataQualityStatus.VERIFIED,
+        historical_eligibility=HistoricalEligibilityStatus.STRICT_PIT_VERIFIED,
+        file_prefix="oa_arch_bad",
+    )
+    tampered_archive["source_authenticity_status"] = "VERIFIED_HISTORICAL_ARCHIVE"
+    tampered_archive["vintage_evidence_source"] = "OpenAlex_Official_2020_Monthly_Dump"
+    temp_db.save_raw_snapshot(tampered_archive)
+    with open(tampered_archive["snapshot_path"], "wb") as f:
+        f.write(b'{"tampered": true}')
+    res_h3 = collector.evaluate_historical_pit_eligibility(
+        {"snapshot_id": tampered_archive["snapshot_id"], "raw_sha256": tampered_archive["raw_sha256"]},
+        cutoff_date=date(2020, 12, 31),
+        db=temp_db,
+    )
+    assert res_h3["eligible"] is False
+    assert res_h3["status"] == HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value
+
+    # H4: 真实完整库内历史归档快照（文件完整 + 哈希匹配 + VERIFIED_HISTORICAL_ARCHIVE + 第三方归档证据）在截断日后通过、截断日前拒绝
+    valid_archive = collector.save_raw_response_snapshot(
+        snapshot_dir=snap_dir,
+        request_url="https://archive.openalex.org/releases/2020-12-31",
+        query_params={"year": 2020, "topic": "solid-state battery"},
+        http_status=200,
+        raw_bytes=raw_bytes,
+        as_of_date=date(2020, 12, 31),
+        verified_first_available_at=datetime(2020, 12, 31, 8, 0, 0),
+        quality_status=DataQualityStatus.VERIFIED,
+        historical_eligibility=HistoricalEligibilityStatus.STRICT_PIT_VERIFIED,
+        file_prefix="oa_arch_ok",
+    )
+    valid_archive["source_authenticity_status"] = "VERIFIED_HISTORICAL_ARCHIVE"
+    valid_archive["vintage_evidence_source"] = "OpenAlex_Official_2020_Archive_Release"
+    temp_db.save_raw_snapshot(valid_archive)
+
+    res_h4_ok = collector.evaluate_historical_pit_eligibility(
+        {"snapshot_id": valid_archive["snapshot_id"], "raw_sha256": valid_archive["raw_sha256"]},
+        cutoff_date=date(2020, 12, 31),
+        db=temp_db,
+    )
+    assert res_h4_ok["eligible"] is True
+    assert res_h4_ok["status"] == HistoricalEligibilityStatus.STRICT_PIT_VERIFIED.value
+
+    res_h4_early = collector.evaluate_historical_pit_eligibility(
+        {"snapshot_id": valid_archive["snapshot_id"], "raw_sha256": valid_archive["raw_sha256"]},
+        cutoff_date=date(2020, 6, 30),
+        db=temp_db,
+    )
+    assert res_h4_early["eligible"] is False
+    assert res_h4_early["status"] == HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value
+
+
+# =============================================================================
+# 测试 I (PR #7 P1 整改)：raw_records 不可变历史留痕（禁止覆盖同一主题同一年度多次采集）
+# =============================================================================
+
+def test_i_immutable_raw_records_preserve_versions_without_overwrite(tmp_path, monkeypatch):
+    temp_db = _setup_isolated_db(tmp_path, monkeypatch)
+    pipe = IngestionPipeline()
+    pipe.openalex.snapshot_dir = str(tmp_path / "oa_hist_snaps")
+
+    # 关闭无关数据源，聚焦验证同一来源同一主题同一年度多次采集的不可变版本留痕
+    monkeypatch.setattr(pipe.macro, "collect", lambda: {})
+    monkeypatch.setattr(pipe.enterprise, "get_core_enterprise_financials", lambda: [])
+    monkeypatch.setattr(pipe.enterprise, "get_historical_distress_cohort", lambda: [])
+    monkeypatch.setattr(pipe.github, "search_repositories", lambda *a, **k: [])
+    monkeypatch.setattr(pipe.tech_dataset, "get_historical_tech_training_samples", lambda: [])
+
+    logical_id = "oa_ssb_2020_metrics"
+
+    def _make_run_record(papers_val: int, pub_dt: datetime, ing_dt: datetime, snap_tag: str):
+        raw_bytes = json.dumps({"meta": {"count": papers_val}, "group_by": [{"key": "2020", "count": papers_val}]}).encode("utf-8")
+        meta = pipe.openalex.save_raw_response_snapshot(
+            snapshot_dir=pipe.openalex.snapshot_dir,
+            request_url="https://api.openalex.org/works",
+            query_params={"topic": "ssb", "year": 2020, "tag": snap_tag},
+            http_status=200,
+            raw_bytes=raw_bytes,
+            as_of_date=date(2020, 12, 31),
+            verified_first_available_at=None,
+            quality_status=DataQualityStatus.UNVERIFIED,
+            historical_eligibility=HistoricalEligibilityStatus.CURRENT_SNAPSHOT_HISTORICAL_STATS,
+            file_prefix=f"count_{snap_tag}",
+        )
+        return {
+            "status": "OK",
+            "as_of_date": date(2020, 12, 31),
+            "published_at": pub_dt,
+            "papers_count": papers_val,
+            "citations_count": None,
+            "sampled_citations_count": 50,
+            "citation_count_scope": CitationCountScope.SAMPLED_TOP_CITED_BIASED.value,
+            "active_institutions": 12,
+            "sampled_institutions_count": 12,
+            "institution_count_scope": InstitutionCountScope.COMPLETE_AGGREGATION.value,
+            "citations_cutoff_year": 2020,
+            "historical_eligibility": HistoricalEligibilityStatus.CURRENT_SNAPSHOT_HISTORICAL_STATS.value,
+            "snapshot_id": meta["snapshot_id"],
+            "snapshot_meta": meta,
+            "snapshot_metas": [meta],
+            "feature_lineage": {
+                "papers_count": {"snapshot_id": meta["snapshot_id"], "raw_sha256": meta["raw_sha256"]}
+            },
+            "raw_payload": raw_bytes.decode("utf-8"),
+            "provenance": {
+                "record_id": logical_id,
+                "source_name": "OpenAlex_API",
+                "source_url": "https://api.openalex.org/works",
+                "as_of_date": date(2020, 12, 31),
+                "published_at": pub_dt,
+                "ingested_at": ing_dt,
+                "quality_status": DataQualityStatus.UNVERIFIED.value,
+                "data_version": f"v_{snap_tag}",
+                "raw_hash": meta["raw_sha256"],
+                "snapshot_id": meta["snapshot_id"],
+            },
+        }
+
+    run1_rec = _make_run_record(1800, datetime(2020, 12, 31, 10, 0, 0), datetime(2020, 12, 31, 10, 0, 0), "2020_v1")
+    run2_rec = _make_run_record(1855, datetime(2022, 6, 15, 12, 0, 0), datetime(2022, 6, 15, 12, 0, 0), "2022_v2")
+
+    monkeypatch.setattr(pipe.openalex, "fetch_topic_research_trends", lambda q, *a, **k: [run1_rec] if "solid-state" in q else [])
+    pipe.run_all(verbose=False)
+
+    monkeypatch.setattr(pipe.openalex, "fetch_topic_research_trends", lambda q, *a, **k: [run2_rec] if "solid-state" in q else [])
+    pipe.run_all(verbose=False)
+
+    all_versions = temp_db.get_raw_record_versions(logical_id)
+    assert len(all_versions) == 2
+    assert list(all_versions["ingestion_version"]) == [1, 2]
+    assert len(set(all_versions["record_id"])) == 2
+    assert len(set(all_versions["snapshot_id"])) == 2
+    assert len(set(all_versions["raw_hash"])) == 2
+
+    # PIT 版本检索：2021 视角仅看见 v1 (1800)，2023 视角可见最新 v2 (1855)
+    v_2021 = temp_db.get_latest_raw_record(logical_id, cutoff_date=date(2021, 12, 31))
+    assert v_2021 is not None
+    assert v_2021["ingestion_version"] == 1
+    assert json.loads(v_2021["payload"])["meta"]["count"] == 1800
+
+    v_2023 = temp_db.get_latest_raw_record(logical_id, cutoff_date=date(2023, 12, 31))
+    assert v_2023 is not None
+    assert v_2023["ingestion_version"] == 2
+    assert json.loads(v_2023["payload"])["meta"]["count"] == 1855
+
+
+# =============================================================================
+# 测试 J (PR #7 P1 整改)：引用统计口径隔离（样本引用禁止冒充全领域总量进入主指标）
+# =============================================================================
+
+def test_j_citation_scope_isolation_and_inflection_guard(tmp_path, monkeypatch):
+    collector = OpenAlexCollector(snapshot_dir=str(tmp_path / "j_snaps"))
+
+    def fake_fetch(url, params=None, **kwargs):
+        gb = (params or {}).get("group_by")
+        if gb == "publication_year":
+            return _mock_json_response({"meta": {"count": 1000}, "group_by": [{"key": "2020", "count": 1000}]}, 200), 200, None
+        if gb == "authorships.institutions.id":
+            return _mock_json_response({"meta": {"count": 1000, "groups_count": 2}, "group_by": [{"key": "https://openalex.org/I1", "count": 500}]}, 200), 200, None
+        works_payload = {
+            "results": [
+                {"id": "W1", "counts_by_year": [{"year": 2020, "cited_by_count": 150}]},
+                {"id": "W2", "counts_by_year": [{"year": 2020, "cited_by_count": 100}]},
+            ]
+        }
+        return _mock_json_response(works_payload, 200), 200, None
+
+    monkeypatch.setattr(collector, "fetch_raw_with_audit", fake_fetch)
+    rows = collector.fetch_topic_research_trends("solid-state battery", start_year=2020, end_year=2020, save_snapshots=True)
+    rec = rows[0]
+
+    # papers_count=1000 但仅采样 2 篇作品：正式 citations_count 必须为 None，样本求和仅存 sampled_citations_count=250
+    assert rec["papers_count"] == 1000
+    assert rec["citations_count"] is None
+    assert rec["sampled_citations_count"] == 250
+    assert rec["citation_count_scope"] == CitationCountScope.SAMPLED_TOP_CITED_BIASED.value
+
+    # 下游 InflectionDetector 对 SAMPLED_TOP_CITED_BIASED 指标不得输出为正式全领域 citations_latest
+    detector = InflectionDetector()
+    df_biased = pd.DataFrame([
+        {
+            "as_of_date": date(2018, 12, 31),
+            "papers_count": 400,
+            "citations_count": None,
+            "sampled_citations_count": 120,
+            "citation_count_scope": CitationCountScope.SAMPLED_TOP_CITED_BIASED.value,
+            "active_institutions": 10,
+        },
+        {
+            "as_of_date": date(2019, 12, 31),
+            "papers_count": 650,
+            "citations_count": None,
+            "sampled_citations_count": 180,
+            "citation_count_scope": CitationCountScope.SAMPLED_TOP_CITED_BIASED.value,
+            "active_institutions": 14,
+        },
+        {
+            "as_of_date": date(2020, 12, 31),
+            "papers_count": 1000,
+            "citations_count": 250,  # 即便脏数据误填，也因 scope!=COMPLETE_DOMAIN_TOTAL 被拦截
+            "sampled_citations_count": 250,
+            "citation_count_scope": CitationCountScope.SAMPLED_TOP_CITED_BIASED.value,
+            "active_institutions": 20,
+        },
+    ])
+    res = detector.analyze_tech_acceleration(df_biased)
+    assert res["status"] == "VALIDATED"
+    assert res["evidence"]["citations_latest"] is None
+    assert res["evidence"]["sampled_citations_latest"] == 250
+    assert res["evidence"]["citation_count_scope"] == CitationCountScope.SAMPLED_TOP_CITED_BIASED.value
+
+
+# =============================================================================
+# 测试 K (PR #7 P1 整改)：特征级快照血缘独立绑证（仅篡改 works_sample 快照必须被 citations_count 校验捕获）
+# =============================================================================
+
+def test_k_feature_lineage_tampering_detects_works_sample_corruption(tmp_path, monkeypatch):
+    temp_db = _setup_isolated_db(tmp_path, monkeypatch)
+    collector = OpenAlexCollector(snapshot_dir=str(tmp_path / "k_snaps"))
+
+    def fake_fetch(url, params=None, **kwargs):
+        gb = (params or {}).get("group_by")
+        if gb == "publication_year":
+            return _mock_json_response({"meta": {"count": 1807}, "group_by": [{"key": "2020", "count": 1807}]}, 200), 200, None
+        if gb == "authorships.institutions.id":
+            return _mock_json_response({"meta": {"count": 1807, "groups_count": 15}, "group_by": [{"key": f"https://openalex.org/I{i}", "count": 10} for i in range(15)]}, 200), 200, None
+        works_payload = {
+            "results": [
+                {"id": "W1", "counts_by_year": [{"year": 2020, "cited_by_count": 107}]},
+            ]
+        }
+        return _mock_json_response(works_payload, 200), 200, None
+
+    monkeypatch.setattr(collector, "fetch_raw_with_audit", fake_fetch)
+    rows = collector.fetch_topic_research_trends('"solid-state battery"', start_year=2020, end_year=2020, save_snapshots=True)
+    rec = rows[0]
+    for smeta in rec["snapshot_metas"]:
+        temp_db.save_raw_snapshot(smeta)
+
+    lineage = rec["feature_lineage"]
+    assert set(lineage.keys()) >= {"papers_count", "citations_count", "active_institutions"}
+    assert lineage["citations_count"]["scope"] == CitationCountScope.SAMPLED_TOP_CITED_BIASED.value
+    assert lineage["papers_count"]["snapshot_id"] != lineage["citations_count"]["snapshot_id"]
+    assert lineage["citations_count"]["snapshot_id"] != lineage["active_institutions"]["snapshot_id"]
+
+    # 未篡改前：papers_count 与 active_institutions 完整口径校验通过；citations_count 允许非完整口径下复算通过，要求完整口径则拒绝
+    assert OpenAlexCollector.verify_feature_lineage(rec, "papers_count", db=temp_db)["verified"] is True
+    assert OpenAlexCollector.verify_feature_lineage(rec, "active_institutions", db=temp_db)["verified"] is True
+    assert OpenAlexCollector.verify_feature_lineage(rec, "citations_count", db=temp_db, require_complete_scope=True)["verified"] is False
+    cit_ok = OpenAlexCollector.verify_feature_lineage(rec, "citations_count", db=temp_db, require_complete_scope=False)
+    assert cit_ok["verified"] is True
+    assert cit_ok["recomputed_value"] == 107
+
+    # 仅篡改 works_sample 原始快照文件（保持 count 与 institutions 原始快照完全不动）
+    works_snap_path = lineage["citations_count"]["snapshot_path"]
+    with open(works_snap_path, "wb") as f:
+        f.write(json.dumps({"results": [{"id": "W1", "counts_by_year": [{"year": 2020, "cited_by_count": 9999}]}]}).encode("utf-8"))
+
+    # papers_count 仍应独立验证通过，但 citations_count / sampled_citations_count 必须立即检出篡改并失败
+    assert OpenAlexCollector.verify_feature_lineage(rec, "papers_count", db=temp_db)["verified"] is True
+    cit_tampered = OpenAlexCollector.verify_feature_lineage(rec, "citations_count", db=temp_db, require_complete_scope=False)
+    assert cit_tampered["verified"] is False
+    assert "SHA-256" in cit_tampered["reason"] or "一致" in cit_tampered["reason"]

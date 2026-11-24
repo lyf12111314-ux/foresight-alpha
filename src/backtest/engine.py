@@ -29,6 +29,7 @@ from src.core.types import (
 from src.backtest.metrics import BacktestMetricsCalculator
 from src.decision_engine.opportunity_pool import OpportunityPoolManager
 from src.diffusion.lgbm_forecaster import LightGBMGrowthForecaster
+from src.ingestion.openalex import OpenAlexCollector
 
 
 class PointInTimeBacktestEngine:
@@ -152,17 +153,22 @@ class PointInTimeBacktestEngine:
                 forecaster.rejection_reason = "HISTORICAL_VINTAGE_UNAVAILABLE: 历史样本缺少 sample_id，无法关联真实原始血缘。"
                 return forecaster
 
+            cutoff_ts = db_manager._resolve_cutoff_ts(cutoff_date)
             provenance = []
             for sid in sample_ids:
                 raw_df = db_manager.query_df(
-                    "SELECT record_id, source_name, published_at, quality_status, raw_hash, snapshot_id "
-                    "FROM raw_records WHERE record_id = ? LIMIT 1;",
-                    [str(sid)],
+                    "SELECT record_id, logical_record_id, ingestion_version, source_name, published_at, quality_status, raw_hash, snapshot_id "
+                    "FROM raw_records "
+                    "WHERE (logical_record_id = ? OR record_id = ?) AND published_at IS NOT NULL AND published_at <= ? "
+                    "ORDER BY ingested_at DESC, COALESCE(ingestion_version, 1) DESC LIMIT 1;",
+                    [str(sid), str(sid), cutoff_ts],
                 )
                 if raw_df.empty:
                     forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
                     forecaster.model_stage = ModelStage.UNTRAINED
-                    forecaster.rejection_reason = f"HISTORICAL_VINTAGE_UNAVAILABLE: 样本 {sid} 在 raw_records 中缺少真实原始记录血缘。"
+                    forecaster.rejection_reason = (
+                        f"HISTORICAL_VINTAGE_UNAVAILABLE: 样本 {sid} 在 raw_records 中缺少截断日 {cutoff_date.isoformat()} 前真实原始记录血缘。"
+                    )
                     return forecaster
 
                 raw_row = raw_df.iloc[0].to_dict()
@@ -180,38 +186,30 @@ class PointInTimeBacktestEngine:
                     forecaster.rejection_reason = f"HISTORICAL_VINTAGE_UNAVAILABLE: 未找到快照 {snap_id} 存证。"
                     return forecaster
 
-                integrity = db_manager.verify_snapshot_file_integrity(str(snap_id))
-                if not integrity.get("verified"):
+                elig = OpenAlexCollector.evaluate_historical_pit_eligibility(
+                    {"snapshot_id": str(snap_id)},
+                    cutoff_date=cutoff_date,
+                    db=db_manager,
+                )
+                if not elig.get("eligible"):
                     forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
                     forecaster.model_stage = ModelStage.UNTRAINED
                     forecaster.rejection_reason = (
-                        f"HISTORICAL_VINTAGE_UNAVAILABLE: 快照 {snap_id} 内容完整性校验失败 ({integrity.get('reason')})。"
-                    )
-                    return forecaster
-
-                v_first = snap_rec.get("verified_first_available_at")
-                h_elig = snap_rec.get("historical_eligibility")
-                if (
-                    h_elig != "STRICT_PIT_VERIFIED"
-                    or v_first is None
-                    or pd.isna(v_first)
-                    or pd.to_datetime(v_first).date() > cutoff_date
-                ):
-                    forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
-                    forecaster.model_stage = ModelStage.UNTRAINED
-                    forecaster.rejection_reason = (
-                        f"HISTORICAL_VINTAGE_UNAVAILABLE: 样本 {sid} 历史资格={h_elig}，"
-                        f"缺少截断日 {cutoff_date.isoformat()} 前可核验的历史版本证明。"
+                        f"HISTORICAL_VINTAGE_UNAVAILABLE: 样本 {sid} 未通过严格 PIT 快照核验 "
+                        f"({elig.get('status')}: {elig.get('reason')})。"
                     )
                     return forecaster
 
                 provenance.append({
                     "record_id": raw_row.get("record_id"),
+                    "logical_record_id": raw_row.get("logical_record_id") or raw_row.get("record_id"),
+                    "ingestion_version": int(raw_row.get("ingestion_version") or 1),
                     "quality_status": raw_row.get("quality_status"),
                     "raw_hash": raw_row.get("raw_hash"),
                     "snapshot_id": str(snap_id),
                     "snapshot_path": snap_rec.get("snapshot_path"),
-                    "historical_eligibility": h_elig,
+                    "historical_eligibility": elig.get("status"),
+                    "vintage_evidence_source": snap_rec.get("vintage_evidence_source"),
                 })
 
             forecaster.fit_verified(
