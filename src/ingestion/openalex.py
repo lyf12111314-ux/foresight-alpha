@@ -102,6 +102,30 @@ class OpenAlexCollector(BaseCollector):
         return inst_ids, works_with_inst
 
     @staticmethod
+    def _filter_eligible_works_by_cutoff(
+        works: List[Dict[str, Any]], cutoff_year: Optional[int]
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """过滤掉发表日期晚于 cutoff_year-12-31 的未来论文，并返回 (合格论文列表, 被排除篇数)。"""
+        if not isinstance(works, list):
+            return [], 0
+        max_cutoff = date(int(cutoff_year), 12, 31) if cutoff_year is not None else None
+        eligible: List[Dict[str, Any]] = []
+        excluded = 0
+        for w in works:
+            if not isinstance(w, dict):
+                continue
+            pub_s = w.get("publication_date")
+            if max_cutoff is not None and pub_s:
+                try:
+                    if date.fromisoformat(str(pub_s)[:10]) > max_cutoff:
+                        excluded += 1
+                        continue
+                except ValueError:
+                    pass
+            eligible.append(w)
+        return eligible, excluded
+
+    @staticmethod
     def evaluate_historical_pit_eligibility(
         record: Dict[str, Any],
         cutoff_date: date,
@@ -115,6 +139,11 @@ class OpenAlexCollector(BaseCollector):
         3. 必须重新计算磁盘快照字节 SHA-256 并核验第三方历史归档证据、首次可获取时间与截止日期；
         4. 无可验证历史版本证据时一律返回 HISTORICAL_VINTAGE_UNAVAILABLE。
         """
+        cutoff_d = (
+            cutoff_date.date()
+            if isinstance(cutoff_date, datetime)
+            else (cutoff_date if isinstance(cutoff_date, date) else pd.to_datetime(cutoff_date).date())
+        )
         db_mgr = db if db is not None else db_module.db_manager
         snapshot_id = record.get("snapshot_id")
         if not snapshot_id:
@@ -169,6 +198,22 @@ class OpenAlexCollector(BaseCollector):
                 ),
             }
 
+        if str(snap_rec.get("quality_status") or "").strip() != DataQualityStatus.VERIFIED.value:
+            return {
+                "eligible": False,
+                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
+                "reason": f"数据库快照 quality_status 为 {snap_rec.get('quality_status')}，未达到 VERIFIED。",
+            }
+
+        if snap_rec.get("error_message") or (
+            snap_rec.get("http_status") is not None and not pd.isna(snap_rec.get("http_status")) and int(snap_rec.get("http_status")) != 200
+        ):
+            return {
+                "eligible": False,
+                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
+                "reason": f"数据库快照包含错误或非 200 响应 (http_status={snap_rec.get('http_status')})。",
+            }
+
         source_auth = str(snap_rec.get("source_authenticity_status") or "").strip()
         if source_auth != "VERIFIED_HISTORICAL_ARCHIVE":
             return {
@@ -206,11 +251,11 @@ class OpenAlexCollector(BaseCollector):
                 "reason": f"无法解析数据库 verified_first_available_at: {v_first}",
             }
 
-        if avail_dt.date() > cutoff_date:
+        if avail_dt.date() > cutoff_d:
             return {
                 "eligible": False,
                 "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                "reason": f"历史快照核验首次公开时间 {avail_dt.date()} 晚于预测截断日 {cutoff_date}。",
+                "reason": f"历史快照核验首次公开时间 {avail_dt.date()} 晚于预测截断日 {cutoff_d}。",
             }
 
         db_as_of = snap_rec.get("as_of_date")
@@ -218,11 +263,11 @@ class OpenAlexCollector(BaseCollector):
             as_of_d = db_as_of.date() if isinstance(db_as_of, datetime) else (
                 db_as_of if isinstance(db_as_of, date) else pd.to_datetime(db_as_of).date()
             )
-            if as_of_d > cutoff_date:
+            if as_of_d > cutoff_d:
                 return {
                     "eligible": False,
                     "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                    "reason": f"数据所属日期 {as_of_d} 晚于预测截断日 {cutoff_date}。",
+                    "reason": f"数据所属日期 {as_of_d} 晚于预测截断日 {cutoff_d}。",
                 }
 
         return {
@@ -244,7 +289,26 @@ class OpenAlexCollector(BaseCollector):
         require_complete_scope: bool = True,
     ) -> Dict[str, Any]:
         """独立核验单个输出特征与其对应原始响应快照的完整性、范围口径和可重算一致性。"""
-        lineage_map = record_or_lineage.get("feature_lineage", record_or_lineage) if isinstance(record_or_lineage, dict) else None
+        if isinstance(record_or_lineage, dict):
+            if isinstance(record_or_lineage.get("feature_lineage"), dict):
+                lineage_map = record_or_lineage["feature_lineage"]
+            elif isinstance(record_or_lineage.get("feature_lineage_json"), str):
+                try:
+                    parsed = json.loads(record_or_lineage["feature_lineage_json"])
+                    lineage_map = parsed if isinstance(parsed, dict) else None
+                except Exception:
+                    lineage_map = None
+            else:
+                lineage_map = record_or_lineage
+        elif isinstance(record_or_lineage, str):
+            try:
+                parsed = json.loads(record_or_lineage)
+                lineage_map = parsed if isinstance(parsed, dict) else None
+            except Exception:
+                lineage_map = None
+        else:
+            lineage_map = None
+
         if not isinstance(lineage_map, dict) or feature_name not in lineage_map:
             return {"verified": False, "feature": feature_name, "reason": f"缺少特征 {feature_name} 的快照血缘映射"}
 
@@ -296,7 +360,13 @@ class OpenAlexCollector(BaseCollector):
                     return {"verified": False, "feature": feature_name, "reason": "文献数快照为空且 meta.count != 0"}
                 recomputed_val = 0
             else:
-                recomputed_val = int(group_data[0].get("count"))
+                try:
+                    raw_cnt = group_data[0].get("count") if isinstance(group_data[0], dict) else None
+                    if raw_cnt is None:
+                        raise ValueError("missing count")
+                    recomputed_val = int(raw_cnt)
+                except (TypeError, ValueError) as exc:
+                    return {"verified": False, "feature": feature_name, "reason": f"文献数快照 count 格式无效: {exc}"}
             recorded_val = f_lin.get("value")
             if recomputed_val != recorded_val:
                 return {"verified": False, "feature": feature_name, "reason": f"文献数重算不一致: {recomputed_val} != {recorded_val}"}
@@ -308,19 +378,10 @@ class OpenAlexCollector(BaseCollector):
             cutoff_yr = f_lin.get("cutoff_year")
             if cutoff_yr is None:
                 return {"verified": False, "feature": feature_name, "reason": "引用量血缘缺少 cutoff_year"}
-            max_cutoff = date(int(cutoff_yr), 12, 31)
+            eligible_list, _ = cls._filter_eligible_works_by_cutoff(results_list, int(cutoff_yr))
             calc_sum = 0
             valid_works = 0
-            for w in results_list:
-                if not isinstance(w, dict):
-                    continue
-                pub_s = w.get("publication_date")
-                if pub_s:
-                    try:
-                        if date.fromisoformat(str(pub_s)[:10]) > max_cutoff:
-                            continue
-                    except ValueError:
-                        pass
+            for w in eligible_list:
                 c_val, c_stat = cls.extract_pit_citations_from_work(w, int(cutoff_yr))
                 if c_stat == "OK" and c_val is not None:
                     calc_sum += c_val
@@ -334,13 +395,16 @@ class OpenAlexCollector(BaseCollector):
             method = f_lin.get("method")
             if method == "empty_domain_zero_papers":
                 meta_cnt = (raw_json.get("meta") or {}).get("count")
-                if meta_cnt != 0:
+                if meta_cnt != 0 or f_lin.get("formal_value") != 0:
                     return {"verified": False, "feature": feature_name, "reason": "零论文零机构重算核验失败"}
                 recomputed_val = 0
             elif scope == InstitutionCountScope.COMPLETE_AGGREGATION.value:
                 inst_groups = raw_json.get("group_by") if isinstance(raw_json, dict) else None
                 if not isinstance(inst_groups, list):
                     return {"verified": False, "feature": feature_name, "reason": "机构聚合快照缺少 group_by"}
+                meta_cnt = (raw_json.get("meta") or {}).get("groups_count")
+                if meta_cnt is None or int(meta_cnt) >= cls.OPENALEX_GROUP_CAP or len(inst_groups) >= cls.OPENALEX_GROUP_CAP:
+                    return {"verified": False, "feature": feature_name, "reason": "机构聚合达到上限或缺少 groups_count，不得标记为 COMPLETE_AGGREGATION"}
                 valid_ids = {
                     str(g["key"]).strip()
                     for g in inst_groups
@@ -349,6 +413,57 @@ class OpenAlexCollector(BaseCollector):
                 recomputed_val = len(valid_ids)
                 if recomputed_val != f_lin.get("formal_value"):
                     return {"verified": False, "feature": feature_name, "reason": f"机构数重算不一致: {recomputed_val} != {f_lin.get('formal_value')}"}
+            elif scope == InstitutionCountScope.SAMPLED_WORKS_ONLY.value:
+                if f_lin.get("formal_value") is not None:
+                    return {"verified": False, "feature": feature_name, "reason": "采样机构口径不得填充 formal_value"}
+                if isinstance(raw_json, dict) and isinstance(raw_json.get("results"), list):
+                    eligible_list, _ = cls._filter_eligible_works_by_cutoff(raw_json["results"], f_lin.get("cutoff_year"))
+                    recomputed_val = len(cls.extract_institution_ids_from_works(eligible_list)[0])
+                    if f_lin.get("sampled_value") is None or recomputed_val != f_lin.get("sampled_value"):
+                        return {
+                            "verified": False,
+                            "feature": feature_name,
+                            "reason": f"采样机构数重算不一致: {recomputed_val} != {f_lin.get('sampled_value')}",
+                        }
+                    inst_proof = f_lin.get("institutions_snapshot")
+                    if isinstance(inst_proof, dict) and inst_proof.get("snapshot_id"):
+                        proof_sha = inst_proof.get("raw_sha256")
+                        proof_path = inst_proof.get("snapshot_path")
+                        if db is not None:
+                            db_inst = db.get_raw_snapshot(str(inst_proof["snapshot_id"]))
+                            if not db_inst:
+                                return {"verified": False, "feature": feature_name, "reason": "机构辅助快照未登记在 raw_snapshots"}
+                            db_proof_sha = db_inst.get("raw_sha256")
+                            if proof_sha:
+                                if str(db_proof_sha or "").lower() != str(proof_sha).lower():
+                                    return {"verified": False, "feature": feature_name, "reason": "机构辅助快照数据库哈希不一致"}
+                            elif db_proof_sha is not None:
+                                return {"verified": False, "feature": feature_name, "reason": "机构辅助快照哈希缺失但库中存在哈希"}
+                        if proof_sha and proof_path:
+                            inst_int = BaseCollector.verify_snapshot_integrity(proof_path, proof_sha)
+                            if not inst_int.get("content_integrity_verified"):
+                                return {"verified": False, "feature": feature_name, "reason": f"机构辅助快照完整性校验失败: {inst_int.get('reason')}"}
+                            try:
+                                with open(BaseCollector._resolve_snapshot_path(proof_path), "r", encoding="utf-8") as inf:
+                                    inst_raw = json.load(inf)
+                            except Exception as exc:
+                                return {"verified": False, "feature": feature_name, "reason": f"重读机构辅助快照失败: {exc}"}
+                            inst_groups = inst_raw.get("group_by") if isinstance(inst_raw, dict) else None
+                            inst_meta = (inst_raw.get("meta") or {}) if isinstance(inst_raw, dict) else {}
+                            g_cnt = inst_meta.get("groups_count")
+                            if not isinstance(inst_groups, list):
+                                return {"verified": False, "feature": feature_name, "reason": "机构辅助快照缺少 group_by"}
+                            if g_cnt is not None and int(g_cnt) < cls.OPENALEX_GROUP_CAP and len(inst_groups) < cls.OPENALEX_GROUP_CAP:
+                                return {"verified": False, "feature": feature_name, "reason": "机构辅助快照未达 200 上限却降级为采样"}
+                        elif not inst_proof.get("error_message"):
+                            return {"verified": False, "feature": feature_name, "reason": "机构辅助快照缺少哈希且无失败说明"}
+                elif isinstance(raw_json, dict) and isinstance(raw_json.get("group_by"), list):
+                    if f_lin.get("sampled_value") is not None:
+                        return {"verified": False, "feature": feature_name, "reason": "仅机构聚合快照存在 sampled_value 无来源"}
+                else:
+                    return {"verified": False, "feature": feature_name, "reason": "采样机构快照缺少 results 或 group_by"}
+            elif scope != InstitutionCountScope.UNAVAILABLE.value:
+                return {"verified": False, "feature": feature_name, "reason": f"未支持的机构口径或方法: scope={scope}, method={method}"}
 
         # 3) 统计口径是否满足正式使用要求
         ineligible_scopes = {
@@ -549,23 +664,9 @@ class OpenAlexCollector(BaseCollector):
             citations_status = "CITATIONS_BY_YEAR_UNAVAILABLE"
             works_with_pit_counts = 0
             works_missing_pit_counts = 0
-            excluded_future_pub_works = 0
-            max_cutoff_date = date(eff_cutoff_year, 12, 31)
-
-            eligible_works: List[Dict[str, Any]] = []
-            for w in sample_works:
-                if not isinstance(w, dict):
-                    continue
-                pub_d_str = w.get("publication_date")
-                if pub_d_str:
-                    try:
-                        pub_d = date.fromisoformat(str(pub_d_str)[:10])
-                        if pub_d > max_cutoff_date:
-                            excluded_future_pub_works += 1
-                            continue
-                    except ValueError:
-                        pass
-                eligible_works.append(w)
+            eligible_works, excluded_future_pub_works = self._filter_eligible_works_by_cutoff(
+                sample_works, eff_cutoff_year
+            )
 
             if papers_count == 0 and sample_parse_err is None:
                 sampled_citations_sum = 0
@@ -681,6 +782,41 @@ class OpenAlexCollector(BaseCollector):
             snap_id = count_snap_meta["snapshot_id"] if count_snap_meta else None
             snap_path = count_snap_meta["snapshot_path"] if count_snap_meta else None
 
+            inst_has_file = bool(
+                inst_snap_meta and inst_snap_meta.get("raw_sha256") and inst_snap_meta.get("snapshot_path")
+            )
+            sample_has_file = bool(
+                sample_snap_meta and sample_snap_meta.get("raw_sha256") and sample_snap_meta.get("snapshot_path")
+            )
+            if papers_count == 0:
+                inst_primary_meta = count_snap_meta
+                inst_method = "empty_domain_zero_papers"
+            elif inst_scope == InstitutionCountScope.COMPLETE_AGGREGATION.value and inst_has_file:
+                inst_primary_meta = inst_snap_meta
+                inst_method = "openalex_group_by_institution_id_lt_200_cap"
+            else:
+                inst_primary_meta = sample_snap_meta if sample_has_file else (inst_snap_meta if inst_has_file else None)
+                inst_method = "sampled_works_institution_id_dedup"
+
+            inst_lineage_entry: Dict[str, Any] = {
+                "snapshot_id": inst_primary_meta["snapshot_id"] if inst_primary_meta else None,
+                "raw_sha256": inst_primary_meta["raw_sha256"] if inst_primary_meta else None,
+                "snapshot_path": inst_primary_meta["snapshot_path"] if inst_primary_meta else None,
+                "scope": inst_scope,
+                "method": inst_method,
+                "cutoff_year": eff_cutoff_year,
+                "formal_value": active_institutions,
+                "sampled_value": sampled_inst_count,
+            }
+            if inst_snap_meta is not None and inst_primary_meta is not inst_snap_meta:
+                inst_lineage_entry["institutions_snapshot"] = {
+                    "snapshot_id": inst_snap_meta.get("snapshot_id"),
+                    "raw_sha256": inst_snap_meta.get("raw_sha256"),
+                    "snapshot_path": inst_snap_meta.get("snapshot_path"),
+                    "http_status": inst_snap_meta.get("http_status"),
+                    "error_message": inst_snap_meta.get("error_message"),
+                }
+
             all_snap_metas = [m for m in [count_snap_meta, sample_snap_meta, inst_snap_meta] if m is not None]
             feature_lineage = {
                 "papers_count": {
@@ -703,36 +839,7 @@ class OpenAlexCollector(BaseCollector):
                     "sampled_works_count": len(sample_works),
                     "sampling_order": "cited_by_count:desc",
                 },
-                "active_institutions": {
-                    "snapshot_id": (
-                        inst_snap_meta["snapshot_id"]
-                        if inst_snap_meta
-                        else (snap_id if papers_count == 0 else (sample_snap_meta["snapshot_id"] if sample_snap_meta else None))
-                    ),
-                    "raw_sha256": (
-                        inst_snap_meta["raw_sha256"]
-                        if inst_snap_meta
-                        else (snap_sha if papers_count == 0 else (sample_snap_meta["raw_sha256"] if sample_snap_meta else None))
-                    ),
-                    "snapshot_path": (
-                        inst_snap_meta["snapshot_path"]
-                        if inst_snap_meta
-                        else (snap_path if papers_count == 0 else (sample_snap_meta["snapshot_path"] if sample_snap_meta else None))
-                    ),
-                    "scope": inst_scope,
-                    "method": (
-                        "empty_domain_zero_papers"
-                        if papers_count == 0
-                        else (
-                            "openalex_group_by_institution_id_lt_200_cap"
-                            if inst_scope == InstitutionCountScope.COMPLETE_AGGREGATION.value
-                            else "sampled_works_institution_id_dedup"
-                        )
-                    ),
-                    "formal_value": active_institutions,
-                    "sampled_value": sampled_inst_count,
-                    "fallback_snapshot_id": sample_snap_meta["snapshot_id"] if sample_snap_meta else None,
-                },
+                "active_institutions": inst_lineage_entry,
             }
 
             # 明确记录数据时间语义、版本与当前限制（不通过伪造 published_at 冒充历史版本）

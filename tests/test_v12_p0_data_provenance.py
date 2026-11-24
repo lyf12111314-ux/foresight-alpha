@@ -662,6 +662,30 @@ def test_h_forged_pit_eligibility_rejected_and_db_backed_verified_accepted(tmp_p
     assert res_h3["eligible"] is False
     assert res_h3["status"] == HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value
 
+    # H3b: 磁盘文件完整但 vintage_evidence_source 为自宣 ("self")，仍必须拒绝
+    self_vouch_archive = collector.save_raw_response_snapshot(
+        snapshot_dir=snap_dir,
+        request_url="https://archive.example.org/openalex/2020-self",
+        query_params={"year": 2020, "tag": "self_vouch"},
+        http_status=200,
+        raw_bytes=raw_bytes,
+        as_of_date=date(2020, 12, 31),
+        verified_first_available_at=datetime(2020, 12, 31, 8, 0, 0),
+        quality_status=DataQualityStatus.VERIFIED,
+        historical_eligibility=HistoricalEligibilityStatus.STRICT_PIT_VERIFIED,
+        file_prefix="oa_arch_self",
+    )
+    self_vouch_archive["source_authenticity_status"] = "VERIFIED_HISTORICAL_ARCHIVE"
+    self_vouch_archive["vintage_evidence_source"] = "self"
+    temp_db.save_raw_snapshot(self_vouch_archive)
+    res_h3b = collector.evaluate_historical_pit_eligibility(
+        {"snapshot_id": self_vouch_archive["snapshot_id"], "raw_sha256": self_vouch_archive["raw_sha256"]},
+        cutoff_date=date(2020, 12, 31),
+        db=temp_db,
+    )
+    assert res_h3b["eligible"] is False
+    assert res_h3b["status"] == HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value
+
     # H4: 真实完整库内历史归档快照（文件完整 + 哈希匹配 + VERIFIED_HISTORICAL_ARCHIVE + 第三方归档证据）在截断日后通过、截断日前拒绝
     valid_archive = collector.save_raw_response_snapshot(
         snapshot_dir=snap_dir,
@@ -907,3 +931,111 @@ def test_k_feature_lineage_tampering_detects_works_sample_corruption(tmp_path, m
     cit_tampered = OpenAlexCollector.verify_feature_lineage(rec, "citations_count", db=temp_db, require_complete_scope=False)
     assert cit_tampered["verified"] is False
     assert "SHA-256" in cit_tampered["reason"] or "一致" in cit_tampered["reason"]
+
+
+def test_k2_active_institutions_sampled_and_failed_lineage_verification(tmp_path, monkeypatch):
+    """验证 PR #7 [P1-01]：active_institutions 在 200 上限采样或机构接口失败时正确绑定 works_sample 并严格检出篡改"""
+    temp_db = _setup_isolated_db(tmp_path, monkeypatch)
+    collector = OpenAlexCollector(snapshot_dir=str(tmp_path / "k2_snaps"))
+
+    # 场景 1：institutions 达到 200 截断上限 -> SAMPLED_WORKS_ONLY 主血缘必须指向 works_sample，并附带 institutions_snapshot 截断证据
+    def fake_fetch_capped(url, params=None, **kwargs):
+        gb = (params or {}).get("group_by")
+        if gb == "publication_year":
+            return _mock_json_response({"meta": {"count": 1807}, "group_by": [{"key": "2020", "count": 1807}]}, 200), 200, None
+        if gb == "authorships.institutions.id":
+            groups = [{"key": f"https://openalex.org/I{i}", "count": 5} for i in range(200)]
+            return _mock_json_response({"meta": {"count": 1807, "groups_count": 200}, "group_by": groups}, 200), 200, None
+        works_payload = {
+            "results": [
+                {
+                    "id": "W1",
+                    "publication_date": "2020-03-01",
+                    "counts_by_year": [{"year": 2020, "cited_by_count": 80}],
+                    "authorships": [
+                        {"institutions": [{"id": "https://openalex.org/I1"}, {"id": "https://openalex.org/I2"}]},
+                    ],
+                },
+                {
+                    "id": "W2",
+                    "publication_date": "2020-06-01",
+                    "counts_by_year": [{"year": 2020, "cited_by_count": 27}],
+                    "authorships": [
+                        {"institutions": [{"id": "https://openalex.org/I2"}, {"ror": "https://ror.org/03"}]},
+                    ],
+                },
+            ]
+        }
+        return _mock_json_response(works_payload, 200), 200, None
+
+    monkeypatch.setattr(collector, "fetch_raw_with_audit", fake_fetch_capped)
+    rows = collector.fetch_topic_research_trends('"solid-state battery"', start_year=2020, end_year=2020, save_snapshots=True)
+    rec = rows[0]
+    for smeta in rec["snapshot_metas"]:
+        temp_db.save_raw_snapshot(smeta)
+
+    assert rec["active_institutions"] is None
+    assert rec["sampled_institutions_count"] == 3
+    assert rec["institution_count_scope"] == InstitutionCountScope.SAMPLED_WORKS_ONLY.value
+
+    inst_lin = rec["feature_lineage"]["active_institutions"]
+    assert inst_lin["snapshot_id"] == rec["feature_lineage"]["citations_count"]["snapshot_id"]
+    assert inst_lin["raw_sha256"] == rec["feature_lineage"]["citations_count"]["raw_sha256"]
+    assert inst_lin["institutions_snapshot"]["raw_sha256"]
+
+    assert OpenAlexCollector.verify_feature_lineage(rec, "active_institutions", db=temp_db, require_complete_scope=True)["verified"] is False
+    inst_ok = OpenAlexCollector.verify_feature_lineage(rec, "active_institutions", db=temp_db, require_complete_scope=False)
+    assert inst_ok["verified"] is True
+    assert inst_ok["recomputed_value"] == 3
+
+    # 支持直接传入带 feature_lineage_json 字符串的 tech_metrics 行字典
+    tm_row_like = {"feature_lineage_json": json.dumps(rec["feature_lineage"], ensure_ascii=False)}
+    assert OpenAlexCollector.verify_feature_lineage(tm_row_like, "active_institutions", db=temp_db, require_complete_scope=False)["recomputed_value"] == 3
+
+    # 仅篡改 works_sample 快照：active_institutions 与 citations_count 均应失败，papers_count 仍通过
+    with open(inst_lin["snapshot_path"], "wb") as f:
+        f.write(json.dumps({"results": [{"id": "W1", "authorships": []}]}).encode("utf-8"))
+
+    assert OpenAlexCollector.verify_feature_lineage(rec, "papers_count", db=temp_db)["verified"] is True
+    assert OpenAlexCollector.verify_feature_lineage(rec, "active_institutions", db=temp_db, require_complete_scope=False)["verified"] is False
+
+    # 场景 2：institutions 聚合接口 HTTP 500 失败而 works_sample 成功 -> 仍必须绑定 works_sample 有效快照并通过采样校验
+    collector2 = OpenAlexCollector(snapshot_dir=str(tmp_path / "k2_fail_snaps"))
+
+    def fake_fetch_inst_fail(url, params=None, **kwargs):
+        gb = (params or {}).get("group_by")
+        if gb == "publication_year":
+            return _mock_json_response({"meta": {"count": 500}, "group_by": [{"key": "2020", "count": 500}]}, 200), 200, None
+        if gb == "authorships.institutions.id":
+            r500 = MagicMock(spec=requests.Response)
+            r500.status_code = 500
+            return r500, 500, "INST_HTTP_500_FAILED"
+        works_payload = {
+            "results": [
+                {
+                    "id": "W10",
+                    "publication_date": "2020-02-01",
+                    "counts_by_year": [{"year": 2020, "cited_by_count": 40}],
+                    "authorships": [
+                        {"institutions": [{"id": "https://openalex.org/I10"}, {"id": "https://openalex.org/I11"}]},
+                    ],
+                }
+            ]
+        }
+        return _mock_json_response(works_payload, 200), 200, None
+
+    monkeypatch.setattr(collector2, "fetch_raw_with_audit", fake_fetch_inst_fail)
+    rows2 = collector2.fetch_topic_research_trends("solid-state-electrolyte", start_year=2020, end_year=2020, save_snapshots=True)
+    rec2 = rows2[0]
+    for smeta in rec2["snapshot_metas"]:
+        temp_db.save_raw_snapshot(smeta)
+
+    inst_lin2 = rec2["feature_lineage"]["active_institutions"]
+    assert inst_lin2["snapshot_id"] == rec2["feature_lineage"]["citations_count"]["snapshot_id"]
+    assert inst_lin2["raw_sha256"] is not None
+    assert inst_lin2["institutions_snapshot"]["http_status"] == 500
+    assert inst_lin2["institutions_snapshot"]["raw_sha256"] is None
+
+    ok2 = OpenAlexCollector.verify_feature_lineage(rec2, "active_institutions", db=temp_db, require_complete_scope=False)
+    assert ok2["verified"] is True
+    assert ok2["recomputed_value"] == 2
