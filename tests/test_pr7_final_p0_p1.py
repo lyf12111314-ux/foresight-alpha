@@ -320,10 +320,50 @@ def test_p0_f_controlled_offline_test_credential_isolated_from_production(tmp_pa
     assert prod_mode["eligible"] is False
     assert prod_mode["status"] == HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value
 
-    # 3) PointInTimeBacktestEngine 正式严格回测同样拒绝仅具离线测试凭证的样本
+    # 3) PointInTimeBacktestEngine 正式严格回测在存在 25 条关联该测试凭证快照的训练样本时，仍必须拒绝
+    conn = temp_db.get_connection()
+    try:
+        for i in range(25):
+            sid = f"TEST_CRED_SAMPLE_{i}"
+            conn.execute(
+                """
+                INSERT INTO tech_training_samples
+                (sample_id, topic_id, base_date, published_at, feature_published_at, feature_ingested_at, velocity_1y, acceleration, active_institutions, github_momentum, macro_multiplier, entropy_score, novelty_score, label_1y_period_end, label_1y_status, target_1y, label_3y_period_end, label_3y_status, target_3y, label_5y_period_end, label_5y_status, target_5y, quality_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    sid, f"T_{i % 4}", date(2016, 12, 31), datetime(2016, 12, 31), datetime(2016, 12, 31), datetime(2020, 12, 31),
+                    10.0 + i, 2.0, 15.0, 50.0, 1.0, 0.7, 0.8,
+                    date(2017, 12, 31), "MATURED", 1.5,
+                    date(2019, 12, 31), "MATURED", 2.5,
+                    date(2021, 12, 31), "NOT_MATURED", None,
+                    "VERIFIED",
+                ],
+            )
+            temp_db.append_raw_record(
+                {
+                    "record_id": sid,
+                    "logical_record_id": sid,
+                    "source_name": "OpenAlex_API",
+                    "source_url": "https://api.openalex.org/works",
+                    "as_of_date": date(2020, 12, 31),
+                    "published_at": datetime(2020, 12, 31, 8, 0, 0),
+                    "ingested_at": datetime(2020, 12, 31, 8, 0, 0),
+                    "quality_status": "VERIFIED",
+                    "data_version": "v_test",
+                    "raw_hash": meta["raw_sha256"],
+                    "payload": "{}",
+                    "snapshot_id": meta["snapshot_id"],
+                },
+                conn=conn,
+            )
+    finally:
+        conn.close()
+
     engine = PointInTimeBacktestEngine()
     bt_model = engine.train_historical_forecaster(cutoff_date=date(2020, 12, 31), horizon_years=3, require_verified=True)
     assert bt_model.model_stage.value == "UNTRAINED"
+    assert "HISTORICAL_VINTAGE_UNAVAILABLE" in (bt_model.rejection_reason or "")
 
 
 # =============================================================================
@@ -569,3 +609,85 @@ def test_p1_f_model_prediction_explicitly_linked_to_tech_feature_version(tmp_pat
     reproduced_for_forecast = temp_db.get_tech_metric_by_version(linked_fv_id)
     assert reproduced_for_forecast["papers_count"] == 1841
     assert reproduced_for_forecast["snapshot_id"] == "snap_ssb_v1"
+
+    # P1-2 回归：在 v2 (2026-11-24) 写入后，按中间截断日 2026-11-23 调用 build_opportunity_pool 仍必须精确选中 v1 (1841)
+    candidates_nov23 = pool_mgr.build_opportunity_pool(cutoff_date=date(2026, 11, 23))
+    ssb_nov23 = next(c for c in candidates_nov23 if c["topic_id"] == "TOPIC_SOLID_STATE_BATT")
+    assert ssb_nov23["feature_version_id"] == fv_v1
+
+
+def test_p1_g_github_enrichment_versioned_without_mutating_prior_versions(tmp_path, monkeypatch):
+    """P1-1 回归：GitHub 生态指标通过 append_tech_metric_version 不可变版本追加，不静默覆盖旧版本，且 tech_metrics 与版本表一致"""
+    temp_db = _setup_isolated_db(tmp_path, monkeypatch)
+    pipe = IngestionPipeline()
+    pipe.openalex.snapshot_dir = str(tmp_path / "p1g_oa_snaps")
+    pipe.github.snapshot_dir = str(tmp_path / "p1g_gh_snaps")
+    monkeypatch.setattr(pipe.macro, "collect", lambda: {})
+    monkeypatch.setattr(pipe.enterprise, "get_core_enterprise_financials", lambda: [])
+    monkeypatch.setattr(pipe.enterprise, "get_historical_distress_cohort", lambda: [])
+    monkeypatch.setattr(pipe.tech_dataset, "get_historical_tech_training_samples", lambda: [])
+
+    rec_oa = _make_mock_openalex_rec(pipe, 950, datetime(2026, 11, 23, 12, 0, 0), "embodied_v1")
+    rec_oa["provenance"]["record_id"] = "oa_embodied_2020"
+    monkeypatch.setattr(
+        pipe.openalex,
+        "fetch_topic_research_trends",
+        lambda q, *a, **k: [rec_oa] if "embodied" in q.lower() else [],
+    )
+
+    def _make_gh_repos(stars_val: int, snap_id: str):
+        now_dt = datetime(2026, 11, 23 if stars_val == 100 else 24, 15, 0, 0)
+        return [
+            {
+                "repo_id": "999",
+                "full_name": "org/embodied-sim",
+                "stars": stars_val,
+                "forks": stars_val // 10,
+                "snapshot_id": snap_id,
+                "snapshot_meta": {
+                    "snapshot_id": snap_id,
+                    "source_name": "GitHub_API",
+                    "request_url": "https://api.github.com/search/repositories",
+                    "query_params": {"q": "embodied-ai"},
+                    "http_status": 200,
+                    "ingested_at_utc": now_dt,
+                    "as_of_date": date(2026, 11, 23),
+                    "quality_status": DataQualityStatus.UNVERIFIED.value,
+                    "raw_sha256": hashlib.sha256(f"gh_{stars_val}".encode()).hexdigest(),
+                    "snapshot_path": None,
+                    "historical_eligibility": HistoricalEligibilityStatus.CURRENT_STATE_ONLY.value,
+                },
+                "raw_payload": json.dumps({"stars": stars_val}),
+                "provenance": {
+                    "record_id": "gh_embodied_999",
+                    "source_name": "GitHub_API",
+                    "source_url": "https://github.com/org/embodied-sim",
+                    "as_of_date": date(2026, 11, 23),
+                    "published_at": now_dt,
+                    "ingested_at": now_dt,
+                    "quality_status": DataQualityStatus.UNVERIFIED.value,
+                    "data_version": f"gh_{stars_val}",
+                    "raw_hash": hashlib.sha256(f"gh_{stars_val}".encode()).hexdigest(),
+                    "snapshot_id": snap_id,
+                },
+            }
+        ]
+
+    monkeypatch.setattr(pipe.github, "search_repositories", lambda kw, *a, **k: _make_gh_repos(100, "gh_snap_100") if kw == "embodied-ai" else [])
+    pipe.run_all(verbose=False)
+
+    monkeypatch.setattr(pipe.github, "search_repositories", lambda kw, *a, **k: _make_gh_repos(250, "gh_snap_250") if kw == "embodied-ai" else [])
+    pipe.run_all(verbose=False)
+
+    latest = temp_db.get_latest_tech_metric("TOPIC_EMBODIED_AI", date(2020, 12, 31))
+    assert latest is not None
+    assert latest["github_stars"] == 250
+    reproduced_latest = temp_db.get_tech_metric_by_version(latest["latest_feature_version_id"])
+    assert reproduced_latest is not None
+    assert reproduced_latest["github_stars"] == 250
+    assert "gh_snap_250" in json.loads(reproduced_latest["source_snapshot_ids"])
+
+    all_vers = temp_db.get_tech_metric_versions("TOPIC_EMBODIED_AI", date(2020, 12, 31))
+    stars_history = [int(x) for x in all_vers["github_stars"].dropna().tolist()]
+    assert 100 in stars_history and 250 in stars_history
+

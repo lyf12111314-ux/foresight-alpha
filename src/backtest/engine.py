@@ -274,8 +274,8 @@ class PointInTimeBacktestEngine:
                 outcome = GroundTruthOutcome.NOT_MATURED
                 growth_actual = None
             else:
-                # 真实历史数据 (仅允许读取到 evaluation_date 的已公开数据)
-                df_hist = db_manager.query_point_in_time("tech_metrics", evaluation_date, target_col="topic_id", target_val=tid)
+                # 真实历史数据 (按 evaluation_date 从不可变特征版本表读取当时已公开的最新版本)
+                df_hist = db_manager.query_tech_metrics_point_in_time(evaluation_date, topic_id=tid)
                 if not df_hist.empty and len(df_hist) >= 2:
                     df_hist["as_of_dt"] = pd.to_datetime(df_hist["as_of_date"])
                     sub_cutoff = df_hist[df_hist["as_of_dt"] <= cutoff_dt]

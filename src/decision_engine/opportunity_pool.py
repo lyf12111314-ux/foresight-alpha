@@ -89,10 +89,8 @@ class OpportunityPoolManager:
 
         try:
             for tid, tname, domain_id in topics:
-                # 获取该主题技术时序指标 (严禁在无数据时全表扫描泄漏未来信息)
-                topic_metrics = db_manager.query_point_in_time(
-                    "tech_metrics", cutoff_date, target_col="topic_id", target_val=tid
-                )
+                # 获取该主题截止时点可获得的不可变技术特征版本 (严禁因后续重采覆盖导致历史版本消失或前视泄露)
+                topic_metrics = db_manager.query_tech_metrics_point_in_time(cutoff_date, topic_id=tid)
 
                 # 拐点检测
                 inflection_res = self.inflection_detector.analyze_tech_acceleration(topic_metrics)

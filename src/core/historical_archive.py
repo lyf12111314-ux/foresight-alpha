@@ -16,7 +16,7 @@ import hmac
 import json
 import os
 import secrets
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Dict, Optional
 
 import pandas as pd
@@ -60,7 +60,7 @@ def _normalize_timestamp(ts: Any) -> Optional[datetime]:
             return None
         dt = parsed.to_pydatetime()
         if dt.tzinfo is not None:
-            dt = dt.replace(tzinfo=None)
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
         return dt
     except Exception:
         return None

@@ -303,17 +303,78 @@ class IngestionPipeline:
                     self._append_raw_record(conn, prov, r["raw_payload"], snapshot_id=prov.get("snapshot_id"))
                     stats["raw_records"] += 1
 
-                # 仅作为当前查询时点生态观察写入（明确标为 github_pit_eligible=FALSE），无仓库返回时绝不写 0
+                # 仅作为当前查询时点生态观察以不可变新版本追加写入（明确标为 github_pit_eligible=FALSE），绝不覆盖旧版本且无仓库时不写 0
                 if repos:
                     star_vals = [r["stars"] for r in repos if r.get("stars") is not None]
                     fork_vals = [r["forks"] for r in repos if r.get("forks") is not None]
                     tot_stars = sum(star_vals) if star_vals else None
                     tot_forks = sum(fork_vals) if fork_vals else None
-                    conn.execute("""
-                        UPDATE tech_metrics
-                        SET github_stars = ?, github_forks = ?, github_pit_eligible = FALSE
-                        WHERE topic_id = ? AND as_of_date = (SELECT MAX(as_of_date) FROM tech_metrics WHERE topic_id = ?);
-                    """, [tot_stars, tot_forks, topic_id, topic_id])
+                    latest_tm_df = conn.execute(
+                        "SELECT * FROM tech_metrics WHERE topic_id = ? ORDER BY as_of_date DESC LIMIT 1;",
+                        [topic_id],
+                    ).df()
+                    if not latest_tm_df.empty:
+                        base_row = latest_tm_df.iloc[0].to_dict()
+                        def _v(val):
+                            if val is None:
+                                return None
+                            try:
+                                import pandas as _pd
+                                if _pd.isna(val):
+                                    return None
+                            except Exception:
+                                pass
+                            return val
+
+                        existing_snaps: List[str] = []
+                        prev_fv_id = _v(base_row.get("latest_feature_version_id"))
+                        if prev_fv_id:
+                            prev_df = conn.execute(
+                                "SELECT source_snapshot_ids FROM tech_metric_versions WHERE feature_version_id = ? LIMIT 1;",
+                                [prev_fv_id],
+                            ).df()
+                            if not prev_df.empty and _v(prev_df.iloc[0]["source_snapshot_ids"]):
+                                try:
+                                    parsed_snaps = json.loads(prev_df.iloc[0]["source_snapshot_ids"])
+                                    if isinstance(parsed_snaps, list):
+                                        existing_snaps = [str(x) for x in parsed_snaps if x]
+                                except Exception:
+                                    pass
+                        if _v(base_row.get("snapshot_id")):
+                            existing_snaps.append(str(base_row["snapshot_id"]))
+                        merged_snaps = sorted(set(existing_snaps) | {str(s) for s in saved_gh_snaps if s})
+
+                        now_ts = datetime.utcnow()
+                        db_manager.append_tech_metric_version(
+                            {
+                                "topic_id": topic_id,
+                                "as_of_date": _v(base_row.get("as_of_date")),
+                                "published_at": _v(base_row.get("published_at")) or now_ts,
+                                "ingested_at": now_ts,
+                                "feature_computed_at": now_ts,
+                                "processor_code_version": getattr(self.github, "processor_code_version", "v1.2-p1-github-versioned"),
+                                "feature_lineage_json": _v(base_row.get("feature_lineage_json")),
+                                "source_snapshot_ids": merged_snaps,
+                                "papers_count": _v(base_row.get("papers_count")),
+                                "citations_count": _v(base_row.get("citations_count")),
+                                "sampled_citations_count": _v(base_row.get("sampled_citations_count")),
+                                "citation_count_scope": _v(base_row.get("citation_count_scope")),
+                                "active_institutions": _v(base_row.get("active_institutions")),
+                                "sampled_institutions_count": _v(base_row.get("sampled_institutions_count")),
+                                "institution_count_scope": _v(base_row.get("institution_count_scope")),
+                                "github_stars": tot_stars,
+                                "github_forks": tot_forks,
+                                "commit_velocity": _v(base_row.get("commit_velocity")),
+                                "entropy_score": _v(base_row.get("entropy_score")),
+                                "novelty_score": _v(base_row.get("novelty_score")),
+                                "github_pit_eligible": False,
+                                "snapshot_id": _v(base_row.get("snapshot_id")),
+                                "citations_cutoff_year": _v(base_row.get("citations_cutoff_year")),
+                                "historical_eligibility": _v(base_row.get("historical_eligibility")),
+                            },
+                            conn=conn,
+                            update_latest=True,
+                        )
 
             if verbose:
                 print("[5/5] Ingesting Multi-Horizon Historical Tech Training Samples...")

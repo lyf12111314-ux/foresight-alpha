@@ -1044,6 +1044,70 @@ class DatabaseManager:
             return None
         return df.iloc[0].to_dict()
 
+    def query_tech_metrics_point_in_time(
+        self,
+        cutoff_date: date,
+        topic_id: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """按 cutoff_date 从不可变 tech_metric_versions 检索每个 (topic_id, as_of_date) 当时已公开的最新版本。
+
+        同时向后兼容直接向 tech_metrics 写入但未走 append_tech_metric_version 的历史/测试数据，
+        确保二次采集更新 tech_metrics.published_at 后不会遮蔽两次采集之间的历史版本。
+        """
+        cutoff_ts = self._resolve_cutoff_ts(cutoff_date)
+        params: List[Any] = [cutoff_ts]
+        topic_clause = ""
+        if topic_id is not None:
+            topic_clause = " AND topic_id = ?"
+            params.append(topic_id)
+
+        ver_df = self.query_df(
+            f"""
+            SELECT * EXCLUDE (rn) FROM (
+                SELECT
+                    topic_id, as_of_date, published_at, papers_count, citations_count,
+                    active_institutions, github_stars, github_forks, commit_velocity,
+                    entropy_score, novelty_score, snapshot_id, historical_eligibility,
+                    institution_count_scope, citations_cutoff_year, github_pit_eligible,
+                    sampled_citations_count, citation_count_scope, sampled_institutions_count,
+                    feature_lineage_json, feature_version_id AS latest_feature_version_id,
+                    feature_version_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY topic_id, as_of_date
+                        ORDER BY ingested_at DESC, feature_computed_at DESC
+                    ) AS rn
+                FROM tech_metric_versions
+                WHERE published_at IS NOT NULL AND published_at <= ? {topic_clause}
+            ) t
+            WHERE rn = 1
+            ORDER BY as_of_date ASC;
+            """,
+            params,
+        )
+
+        tm_df = self.query_point_in_time(
+            "tech_metrics",
+            cutoff_date,
+            target_col="topic_id" if topic_id is not None else None,
+            target_val=topic_id,
+        )
+        if ver_df.empty:
+            return tm_df
+        if tm_df.empty:
+            return ver_df
+
+        seen_keys = {
+            (str(r["topic_id"]), str(r["as_of_date"])[:10])
+            for _, r in ver_df.iterrows()
+        }
+        extra_rows = tm_df[
+            ~tm_df.apply(lambda r: (str(r["topic_id"]), str(r["as_of_date"])[:10]) in seen_keys, axis=1)
+        ]
+        if extra_rows.empty:
+            return ver_df
+        combined = pd.concat([ver_df, extra_rows], ignore_index=True)
+        return combined.sort_values("as_of_date").reset_index(drop=True)
+
     def append_raw_record(self, record: Dict[str, Any], conn=None) -> str:
         """不可变追加原始采集记录至 raw_records (严禁使用 INSERT OR REPLACE 覆盖历史采集事件)。
 
