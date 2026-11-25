@@ -249,6 +249,16 @@ class OpportunityPoolManager:
                     independent_calibration_prob=None  # 未执行独立历史校准前，强制为 None
                 )
 
+                # 关联本次预测实际使用的不可变技术特征版本标识 (P1 历史复现链路)
+                used_feature_version_ids: List[str] = []
+                if not topic_metrics.empty and "latest_feature_version_id" in topic_metrics.columns:
+                    used_feature_version_ids = [
+                        str(v)
+                        for v in topic_metrics["latest_feature_version_id"].tolist()
+                        if v is not None and not pd.isna(v) and str(v).strip()
+                    ]
+                latest_fv_id = used_feature_version_ids[-1] if used_feature_version_ids else None
+
                 # 附加详情
                 synthesized["domain_id"] = domain_id
                 synthesized["stage_description"] = diffusion_res.get("stage_description", "")
@@ -258,14 +268,16 @@ class OpportunityPoolManager:
                 synthesized["inflection_evidence"] = inflection_res.get("evidence", {})
                 synthesized["survival_status"] = survival_res.get("status", "INSUFFICIENT_DATA")
                 synthesized["features"] = lgbm_features
-                synthesized["feature_version"] = f"feat_{cutoff_date.strftime('%Y%m%d')}_{tid}"
+                synthesized["feature_version_id"] = latest_fv_id
+                synthesized["feature_version_ids"] = used_feature_version_ids
+                synthesized["feature_version"] = latest_fv_id or f"feat_{cutoff_date.strftime('%Y%m%d')}_{tid}"
                 synthesized["feature_published_at"] = (
                     topic_metrics["published_at"].iloc[-1]
                     if (not topic_metrics.empty and "published_at" in topic_metrics)
                     else None
                 )
 
-                # 持久化记录到 model_forecasts (不可变版本化存储，防止静默覆盖)
+                # 持久化记录到 model_forecasts (不可变版本化存储，显式绑定所用技术特征版本)
                 fc = synthesized["forecast_record"]
                 base_forecast_id = fc["forecast_id"]
                 existing_recs = conn.execute(
@@ -280,16 +292,17 @@ class OpportunityPoolManager:
 
                 conn.execute("""
                     INSERT INTO model_forecasts
-                    (forecast_id, target_id, target_level, model_name, model_version, as_of_data_date, prediction_created_at, horizon_years, predicted_metric, point_estimate, ci_low, ci_high, confidence_score, prediction_status, is_verified_forecast, scenarios_json, drivers_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    (forecast_id, target_id, target_level, model_name, model_version, as_of_data_date, prediction_created_at, horizon_years, predicted_metric, point_estimate, ci_low, ci_high, confidence_score, prediction_status, is_verified_forecast, scenarios_json, drivers_json, feature_version_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """, [
                     actual_forecast_id, fc["target_id"], fc["target_level"],
                     fc["model_name"], fc["model_version"], fc["as_of_data_date"],
                     fc["prediction_created_at"], fc["horizon_years"], fc["predicted_metric"],
                     fc["point_estimate"], fc["confidence_interval_low"], fc["confidence_interval_high"],
                     fc["confidence_score"], fc["prediction_status"], fc["is_verified_forecast"],
-                    json.dumps(fc["scenarios"]), json.dumps(fc["driver_features"])
+                    json.dumps(fc["scenarios"]), json.dumps(fc["driver_features"]), latest_fv_id
                 ])
+                synthesized["forecast_id"] = actual_forecast_id
 
                 pool_candidates.append(synthesized)
 

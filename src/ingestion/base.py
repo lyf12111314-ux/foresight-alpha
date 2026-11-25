@@ -199,6 +199,13 @@ class BaseCollector(ABC):
             content_integrity_verified = False
             source_authenticity = "FETCH_FAILED_NO_RESPONSE"
 
+        # 第一层普通数据采集严禁自行授予 STRICT_PIT_VERIFIED，仅保留原始证据与未认证采集记录
+        safe_eligibility = (
+            HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE
+            if historical_eligibility == HistoricalEligibilityStatus.STRICT_PIT_VERIFIED
+            else historical_eligibility
+        )
+
         record = RawSnapshotRecord(
             snapshot_id=snapshot_id,
             source_name=self.source_name,
@@ -207,16 +214,16 @@ class BaseCollector(ABC):
             http_status=http_status,
             ingested_at_utc=now_utc,
             as_of_date=as_of_date,
-            verified_first_available_at=verified_first_available_at,
+            verified_first_available_at=None,
             quality_status=quality_status,
             raw_sha256=raw_sha256,
             snapshot_path=raw_path,
             processor_code_version=self.processor_code_version,
-            historical_eligibility=historical_eligibility,
+            historical_eligibility=safe_eligibility,
             error_message=error_message,
             content_integrity_verified=content_integrity_verified,
             source_authenticity_status=source_authenticity,
-            historical_availability_status=historical_eligibility.value,
+            historical_availability_status=safe_eligibility.value,
         )
 
         meta_abs_path = os.path.abspath(os.path.join(snapshot_dir, f"{snapshot_id}.meta.json"))

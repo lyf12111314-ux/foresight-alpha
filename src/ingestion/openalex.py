@@ -130,155 +130,29 @@ class OpenAlexCollector(BaseCollector):
         record: Dict[str, Any],
         cutoff_date: date,
         db: Optional[Any] = None,
+        allow_test_attestation: bool = False,
     ) -> Dict[str, Any]:
         """严格检查记录是否具备历史预测时点 cutoff_date 的 Point-in-Time 回测资格。
 
-        安全铁律 (P0)：
+        安全铁律 (PR #7 P0 最终整改)：
         1. 严禁信任调用方传入的 historical_eligibility / verified_first_available_at / raw_sha256 字段；
-        2. 必须以数据库 raw_snapshots 中已登记且有真实磁盘文件支撑的记录为准；
-        3. 必须重新计算磁盘快照字节 SHA-256 并核验第三方历史归档证据、首次可获取时间与截止日期；
-        4. 无可验证历史版本证据时一律返回 HISTORICAL_VINTAGE_UNAVAILABLE。
+        2. 严禁仅凭 raw_snapshots 中的自填/篡改字段放行，必须经由受控 HistoricalArchiveCertifier 认证封签；
+        3. 评估时重新核验快照磁盘 SHA-256、真实历史归档文件 SHA-256、内容对应关系与截断日期；
+        4. 默认 allow_test_attestation=False，离线测试凭证绝不可进入正式生产 PIT 准入；
+        5. 无可验证历史版本证据时一律返回 HISTORICAL_VINTAGE_UNAVAILABLE。
         """
-        cutoff_d = (
-            cutoff_date.date()
-            if isinstance(cutoff_date, datetime)
-            else (cutoff_date if isinstance(cutoff_date, date) else pd.to_datetime(cutoff_date).date())
-        )
+        from src.core.historical_archive import HistoricalArchiveCertifier
+
         db_mgr = db if db is not None else db_module.db_manager
-        snapshot_id = record.get("snapshot_id")
-        if not snapshot_id:
-            return {
-                "eligible": False,
-                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                "reason": "缺少 snapshot_id，未在系统数据库 raw_snapshots 登记快照记录。",
-            }
-
-        snap_rec = db_mgr.get_raw_snapshot(str(snapshot_id))
-        if not snap_rec:
-            return {
-                "eligible": False,
-                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                "reason": f"快照 {snapshot_id} 未在系统数据库 raw_snapshots 注册，禁止信任自报历史资格字段。",
-            }
-
-        # 核验磁盘快照文件真实存在且重新计算实际 SHA-256 一致
-        integrity = db_mgr.verify_snapshot_file_integrity(str(snapshot_id))
-        if not integrity.get("verified"):
-            return {
-                "eligible": False,
-                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                "reason": f"快照文件完整性校验失败：{integrity.get('reason')}",
-            }
-
-        # 若调用方同时附带了 raw_sha256 / raw_hash，必须与已核验的磁盘实际哈希完全一致
-        caller_hash = record.get("raw_sha256") or record.get("raw_hash")
-        actual_sha = str(integrity.get("sha256") or snap_rec.get("raw_sha256") or "").lower()
-        if caller_hash and str(caller_hash).strip().lower() != actual_sha:
-            return {
-                "eligible": False,
-                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                "reason": "调用方传入的 SHA-256 与数据库及磁盘实际快照不一致。",
-            }
-
-        db_eligibility = snap_rec.get("historical_eligibility")
-        if db_eligibility == HistoricalEligibilityStatus.CURRENT_STATE_ONLY.value:
-            return {
-                "eligible": False,
-                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                "reason": "数据库登记该快照仅反映当日实时状态 (CURRENT_STATE_ONLY)，禁止用于历史回测。",
-            }
-
-        if db_eligibility != HistoricalEligibilityStatus.STRICT_PIT_VERIFIED.value:
-            return {
-                "eligible": False,
-                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                "reason": (
-                    f"数据库登记历史资格为 {db_eligibility or 'UNKNOWN'}，"
-                    "未达到 STRICT_PIT_VERIFIED 严格历史快照证明。"
-                ),
-            }
-
-        if str(snap_rec.get("quality_status") or "").strip() != DataQualityStatus.VERIFIED.value:
-            return {
-                "eligible": False,
-                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                "reason": f"数据库快照 quality_status 为 {snap_rec.get('quality_status')}，未达到 VERIFIED。",
-            }
-
-        if snap_rec.get("error_message") or (
-            snap_rec.get("http_status") is not None and not pd.isna(snap_rec.get("http_status")) and int(snap_rec.get("http_status")) != 200
-        ):
-            return {
-                "eligible": False,
-                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                "reason": f"数据库快照包含错误或非 200 响应 (http_status={snap_rec.get('http_status')})。",
-            }
-
-        source_auth = str(snap_rec.get("source_authenticity_status") or "").strip()
-        if source_auth != "VERIFIED_HISTORICAL_ARCHIVE":
-            return {
-                "eligible": False,
-                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                "reason": (
-                    f"快照来源证据为 {source_auth or 'NONE'}，缺少权威历史归档来源凭证 (VERIFIED_HISTORICAL_ARCHIVE)。"
-                ),
-            }
-
-        vintage_src = str(snap_rec.get("vintage_evidence_source") or "").strip()
-        if vintage_src.lower() in {"", "self", "manual", "auto", "internal", "internal_research_prototype"}:
-            return {
-                "eligible": False,
-                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                "reason": "缺少有效的独立历史首次公开时间来源证据 (vintage_evidence_source)。",
-            }
-
-        v_first = snap_rec.get("verified_first_available_at")
-        if v_first is None or pd.isna(v_first):
-            return {
-                "eligible": False,
-                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                "reason": "数据库快照缺少已核验的首次公开时间 (verified_first_available_at)。",
-            }
-
-        try:
-            avail_dt = pd.to_datetime(v_first)
-            if pd.isna(avail_dt):
-                raise ValueError("NaT")
-        except Exception:
-            return {
-                "eligible": False,
-                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                "reason": f"无法解析数据库 verified_first_available_at: {v_first}",
-            }
-
-        if avail_dt.date() > cutoff_d:
-            return {
-                "eligible": False,
-                "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                "reason": f"历史快照核验首次公开时间 {avail_dt.date()} 晚于预测截断日 {cutoff_d}。",
-            }
-
-        db_as_of = snap_rec.get("as_of_date")
-        if db_as_of is not None and not pd.isna(db_as_of):
-            as_of_d = db_as_of.date() if isinstance(db_as_of, datetime) else (
-                db_as_of if isinstance(db_as_of, date) else pd.to_datetime(db_as_of).date()
-            )
-            if as_of_d > cutoff_d:
-                return {
-                    "eligible": False,
-                    "status": HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value,
-                    "reason": f"数据所属日期 {as_of_d} 晚于预测截断日 {cutoff_d}。",
-                }
-
-        return {
-            "eligible": True,
-            "status": HistoricalEligibilityStatus.STRICT_PIT_VERIFIED.value,
-            "snapshot_id": str(snapshot_id),
-            "sha256": actual_sha,
-            "verified_first_available_at": avail_dt.isoformat(),
-            "vintage_evidence_source": vintage_src,
-            "reason": None,
-        }
+        snapshot_id = record.get("snapshot_id") if isinstance(record, dict) else None
+        caller_hash = (record.get("raw_sha256") or record.get("raw_hash")) if isinstance(record, dict) else None
+        return HistoricalArchiveCertifier.verify_attestation(
+            db=db_mgr,
+            snapshot_id=str(snapshot_id) if snapshot_id else "",
+            cutoff_date=cutoff_date,
+            allow_test_attestation=allow_test_attestation,
+            caller_hash=caller_hash,
+        )
 
     @classmethod
     def verify_feature_lineage(

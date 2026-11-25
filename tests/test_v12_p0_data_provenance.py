@@ -686,8 +686,9 @@ def test_h_forged_pit_eligibility_rejected_and_db_backed_verified_accepted(tmp_p
     assert res_h3b["eligible"] is False
     assert res_h3b["status"] == HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value
 
-    # H4: 真实完整库内历史归档快照（文件完整 + 哈希匹配 + VERIFIED_HISTORICAL_ARCHIVE + 第三方归档证据）在截断日后通过、截断日前拒绝
-    valid_archive = collector.save_raw_response_snapshot(
+    # H4: 即便调用方自填 "OpenAlex_Official_2020_Archive_Release" 并经 save_raw_snapshot 落库，
+    # 普通快照登记也不得获得生产级 STRICT_PIT_VERIFIED 认证（彻底阻断内部自我认证）
+    self_claimed_archive = collector.save_raw_response_snapshot(
         snapshot_dir=snap_dir,
         request_url="https://archive.openalex.org/releases/2020-12-31",
         query_params={"year": 2020, "topic": "solid-state battery"},
@@ -697,22 +698,22 @@ def test_h_forged_pit_eligibility_rejected_and_db_backed_verified_accepted(tmp_p
         verified_first_available_at=datetime(2020, 12, 31, 8, 0, 0),
         quality_status=DataQualityStatus.VERIFIED,
         historical_eligibility=HistoricalEligibilityStatus.STRICT_PIT_VERIFIED,
-        file_prefix="oa_arch_ok",
+        file_prefix="oa_arch_self_claim",
     )
-    valid_archive["source_authenticity_status"] = "VERIFIED_HISTORICAL_ARCHIVE"
-    valid_archive["vintage_evidence_source"] = "OpenAlex_Official_2020_Archive_Release"
-    temp_db.save_raw_snapshot(valid_archive)
+    self_claimed_archive["source_authenticity_status"] = "VERIFIED_HISTORICAL_ARCHIVE"
+    self_claimed_archive["vintage_evidence_source"] = "OpenAlex_Official_2020_Archive_Release"
+    temp_db.save_raw_snapshot(self_claimed_archive)
 
-    res_h4_ok = collector.evaluate_historical_pit_eligibility(
-        {"snapshot_id": valid_archive["snapshot_id"], "raw_sha256": valid_archive["raw_sha256"]},
+    res_h4_blocked = collector.evaluate_historical_pit_eligibility(
+        {"snapshot_id": self_claimed_archive["snapshot_id"], "raw_sha256": self_claimed_archive["raw_sha256"]},
         cutoff_date=date(2020, 12, 31),
         db=temp_db,
     )
-    assert res_h4_ok["eligible"] is True
-    assert res_h4_ok["status"] == HistoricalEligibilityStatus.STRICT_PIT_VERIFIED.value
+    assert res_h4_blocked["eligible"] is False
+    assert res_h4_blocked["status"] == HistoricalEligibilityStatus.HISTORICAL_VINTAGE_UNAVAILABLE.value
 
     res_h4_early = collector.evaluate_historical_pit_eligibility(
-        {"snapshot_id": valid_archive["snapshot_id"], "raw_sha256": valid_archive["raw_sha256"]},
+        {"snapshot_id": self_claimed_archive["snapshot_id"], "raw_sha256": self_claimed_archive["raw_sha256"]},
         cutoff_date=date(2020, 6, 30),
         db=temp_db,
     )

@@ -82,7 +82,40 @@ class DatabaseManager:
                     citation_count_scope VARCHAR,
                     sampled_institutions_count INTEGER,
                     feature_lineage_json JSON,
+                    latest_feature_version_id VARCHAR,
                     PRIMARY KEY (topic_id, as_of_date)
+                );
+            """)
+
+            # 2.1 不可变技术特征历史版本表 (V1.2 P1: 禁止后续采集覆盖旧特征版本)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tech_metric_versions (
+                    feature_version_id VARCHAR PRIMARY KEY,
+                    topic_id VARCHAR NOT NULL,
+                    as_of_date DATE NOT NULL,
+                    published_at TIMESTAMP NOT NULL,
+                    ingested_at TIMESTAMP NOT NULL,
+                    feature_computed_at TIMESTAMP NOT NULL,
+                    processor_code_version VARCHAR NOT NULL,
+                    feature_lineage_json JSON,
+                    source_snapshot_ids JSON,
+                    papers_count BIGINT,
+                    citations_count BIGINT,
+                    sampled_citations_count BIGINT,
+                    citation_count_scope VARCHAR,
+                    active_institutions INTEGER,
+                    sampled_institutions_count INTEGER,
+                    institution_count_scope VARCHAR,
+                    github_stars BIGINT,
+                    github_forks BIGINT,
+                    commit_velocity DOUBLE,
+                    entropy_score DOUBLE,
+                    novelty_score DOUBLE,
+                    github_pit_eligible BOOLEAN,
+                    snapshot_id VARCHAR,
+                    citations_cutoff_year INTEGER,
+                    historical_eligibility VARCHAR,
+                    feature_payload_sha256 VARCHAR NOT NULL
                 );
             """)
 
@@ -139,7 +172,8 @@ class DatabaseManager:
                     prediction_status VARCHAR DEFAULT 'UNVERIFIED_RESEARCH',
                     is_verified_forecast BOOLEAN DEFAULT FALSE,
                     scenarios_json JSON,
-                    drivers_json JSON
+                    drivers_json JSON,
+                    feature_version_id VARCHAR
                 );
             """)
 
@@ -147,6 +181,7 @@ class DatabaseManager:
             try:
                 conn.execute("ALTER TABLE model_forecasts ADD COLUMN IF NOT EXISTS prediction_status VARCHAR DEFAULT 'UNVERIFIED_RESEARCH';")
                 conn.execute("ALTER TABLE model_forecasts ADD COLUMN IF NOT EXISTS is_verified_forecast BOOLEAN DEFAULT FALSE;")
+                conn.execute("ALTER TABLE model_forecasts ADD COLUMN IF NOT EXISTS feature_version_id VARCHAR;")
             except Exception:
                 pass
             conn.execute("""
@@ -450,6 +485,7 @@ class DatabaseManager:
                 ("citation_count_scope", "VARCHAR"),
                 ("sampled_institutions_count", "INTEGER"),
                 ("feature_lineage_json", "JSON"),
+                ("latest_feature_version_id", "VARCHAR"),
             ]:
                 m_id = f"mig_tech_metrics_add_{col}"
                 try:
@@ -462,6 +498,21 @@ class DatabaseManager:
                     else:
                         _record_migration(m_id, "v1.2-p0", f"Add column {col} failed", "FAILED", str(e))
                         raise RuntimeError(f"Database migration failed adding column {col} to tech_metrics: {e}")
+
+            for col, dtype in [
+                ("feature_version_id", "VARCHAR"),
+            ]:
+                m_id = f"mig_model_forecasts_add_{col}"
+                try:
+                    conn.execute(f"ALTER TABLE model_forecasts ADD COLUMN IF NOT EXISTS {col} {dtype};")
+                    _record_migration(m_id, "v1.2-p1", f"Add column {col} to model_forecasts", "SUCCESS")
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "already exists" in err_str:
+                        _record_migration(m_id, "v1.2-p1", f"Column {col} already exists", "ALREADY_APPLIED", str(e))
+                    else:
+                        _record_migration(m_id, "v1.2-p1", f"Add column {col} failed", "FAILED", str(e))
+                        raise RuntimeError(f"Database migration failed adding column {col} to model_forecasts: {e}")
 
             for col, dtype in [
                 ("snapshot_id", "VARCHAR"),
@@ -480,6 +531,122 @@ class DatabaseManager:
                         _record_migration(m_id, "v1.2-p0", f"Add column {col} failed", "FAILED", str(e))
                         raise RuntimeError(f"Database migration failed adding {col} to raw_records: {e}")
 
+            # 4.6. V1.2 P0/P1 最终整改：受控历史归档认证表与不可变技术特征版本表幂等建表及旧库回填
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS historical_archive_attestations (
+                    attestation_id VARCHAR PRIMARY KEY,
+                    snapshot_id VARCHAR NOT NULL,
+                    archive_id VARCHAR NOT NULL,
+                    archive_source_authority VARCHAR NOT NULL,
+                    archive_file_path VARCHAR NOT NULL,
+                    archive_file_sha256 VARCHAR NOT NULL,
+                    snapshot_sha256 VARCHAR NOT NULL,
+                    verified_published_at TIMESTAMP NOT NULL,
+                    as_of_date DATE NOT NULL,
+                    evidence_origin VARCHAR NOT NULL,
+                    certification_mode VARCHAR NOT NULL,
+                    is_test_only BOOLEAN DEFAULT FALSE,
+                    verified_at_utc TIMESTAMP NOT NULL,
+                    attestation_seal VARCHAR NOT NULL
+                );
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS tech_metric_versions (
+                    feature_version_id VARCHAR PRIMARY KEY,
+                    topic_id VARCHAR NOT NULL,
+                    as_of_date DATE NOT NULL,
+                    published_at TIMESTAMP NOT NULL,
+                    ingested_at TIMESTAMP NOT NULL,
+                    feature_computed_at TIMESTAMP NOT NULL,
+                    processor_code_version VARCHAR NOT NULL,
+                    feature_lineage_json JSON,
+                    source_snapshot_ids JSON,
+                    papers_count BIGINT,
+                    citations_count BIGINT,
+                    sampled_citations_count BIGINT,
+                    citation_count_scope VARCHAR,
+                    active_institutions INTEGER,
+                    sampled_institutions_count INTEGER,
+                    institution_count_scope VARCHAR,
+                    github_stars BIGINT,
+                    github_forks BIGINT,
+                    commit_velocity DOUBLE,
+                    entropy_score DOUBLE,
+                    novelty_score DOUBLE,
+                    github_pit_eligible BOOLEAN,
+                    snapshot_id VARCHAR,
+                    citations_cutoff_year INTEGER,
+                    historical_eligibility VARCHAR,
+                    feature_payload_sha256 VARCHAR NOT NULL
+                );
+            """)
+
+            # 将旧版 V1.1/V1.2 数据库中尚未绑定版本 ID 的 tech_metrics 幂等回填至 tech_metric_versions
+            legacy_df = conn.execute(
+                "SELECT * FROM tech_metrics WHERE latest_feature_version_id IS NULL;"
+            ).df()
+            if not legacy_df.empty:
+                for _, lrow in legacy_df.iterrows():
+                    ld = lrow.to_dict()
+                    def _clean(v):
+                        return None if (v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v)) else v
+
+                    payload_hash = self._compute_feature_payload_sha256(ld)
+                    as_of_str = str(_clean(ld.get("as_of_date")))[:10]
+                    fv_id = f"tmv_migrated_{ld['topic_id']}_{as_of_str}_{payload_hash[:12]}"
+                    pub_ts = _clean(ld.get("published_at")) or datetime.utcnow()
+                    snap_list = [_clean(ld.get("snapshot_id"))] if _clean(ld.get("snapshot_id")) else []
+                    conn.execute("""
+                        INSERT INTO tech_metric_versions (
+                            feature_version_id, topic_id, as_of_date, published_at, ingested_at,
+                            feature_computed_at, processor_code_version, feature_lineage_json,
+                            source_snapshot_ids, papers_count, citations_count, sampled_citations_count,
+                            citation_count_scope, active_institutions, sampled_institutions_count,
+                            institution_count_scope, github_stars, github_forks, commit_velocity,
+                            entropy_score, novelty_score, github_pit_eligible, snapshot_id,
+                            citations_cutoff_year, historical_eligibility, feature_payload_sha256
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(feature_version_id) DO NOTHING;
+                    """, [
+                        fv_id,
+                        ld["topic_id"],
+                        _clean(ld.get("as_of_date")),
+                        pub_ts,
+                        pub_ts,
+                        pub_ts,
+                        "legacy-migrated-v1.1",
+                        _clean(ld.get("feature_lineage_json")),
+                        json.dumps(snap_list, ensure_ascii=False),
+                        _clean(ld.get("papers_count")),
+                        _clean(ld.get("citations_count")),
+                        _clean(ld.get("sampled_citations_count")),
+                        _clean(ld.get("citation_count_scope")),
+                        _clean(ld.get("active_institutions")),
+                        _clean(ld.get("sampled_institutions_count")),
+                        _clean(ld.get("institution_count_scope")),
+                        _clean(ld.get("github_stars")),
+                        _clean(ld.get("github_forks")),
+                        _clean(ld.get("commit_velocity")),
+                        _clean(ld.get("entropy_score")),
+                        _clean(ld.get("novelty_score")),
+                        _clean(ld.get("github_pit_eligible")),
+                        _clean(ld.get("snapshot_id")),
+                        _clean(ld.get("citations_cutoff_year")),
+                        _clean(ld.get("historical_eligibility")) or "HISTORICAL_VINTAGE_UNAVAILABLE",
+                        payload_hash,
+                    ])
+                    conn.execute("""
+                        UPDATE tech_metrics
+                        SET latest_feature_version_id = ?
+                        WHERE topic_id = ? AND as_of_date = ? AND latest_feature_version_id IS NULL;
+                    """, [fv_id, ld["topic_id"], _clean(ld.get("as_of_date"))])
+                _record_migration(
+                    "mig_backfill_legacy_tech_metric_versions",
+                    "v1.2-p1",
+                    f"Backfilled {len(legacy_df)} legacy tech_metrics rows to tech_metric_versions",
+                    "SUCCESS",
+                )
+
             # 5. 迁移后模式完整性校验 (Post-Migration Schema Integrity Check)
             self._verify_post_migration_integrity(conn)
 
@@ -491,7 +658,15 @@ class DatabaseManager:
         """校验关键表结构与字段完整性"""
         tables = conn.execute("SHOW TABLES;").fetchall()
         table_names = [t[0] for t in tables]
-        for req_table in ["tech_training_samples", "company_distress_cohort", "model_forecasts", "schema_migrations", "raw_snapshots"]:
+        for req_table in [
+            "tech_training_samples",
+            "company_distress_cohort",
+            "model_forecasts",
+            "schema_migrations",
+            "raw_snapshots",
+            "tech_metric_versions",
+            "historical_archive_attestations",
+        ]:
             if req_table not in table_names:
                 raise RuntimeError(f"迁移后模式完整性校验失败：关键表 {req_table} 缺失。")
 
@@ -539,7 +714,11 @@ class DatabaseManager:
             conn.close()
 
     def save_raw_snapshot(self, snapshot_meta: Dict[str, Any], conn=None) -> None:
-        """写入原始 API 响应快照元数据至 raw_snapshots (不可覆盖既有快照记录)"""
+        """写入原始 API 响应快照元数据至 raw_snapshots (不可覆盖既有快照记录)。
+
+        第一层最小权限收敛 (P0)：普通快照保存接口仅保存原始证据与采集声明，
+        严禁直接授予 STRICT_PIT_VERIFIED、VERIFIED_HISTORICAL_ARCHIVE 或认证历史首次公开时间。
+        """
         close_conn = False
         if conn is None:
             conn = self.get_connection()
@@ -547,6 +726,21 @@ class DatabaseManager:
         try:
             qparams = snapshot_meta.get("query_params", {})
             qparams_json = json.dumps(qparams, sort_keys=True, ensure_ascii=False) if not isinstance(qparams, str) else qparams
+
+            allowed_ordinary_elig = {
+                "CURRENT_SNAPSHOT_HISTORICAL_STATS",
+                "CURRENT_STATE_ONLY",
+                "HISTORICAL_VINTAGE_UNAVAILABLE",
+            }
+            req_elig = str(snapshot_meta.get("historical_eligibility") or "HISTORICAL_VINTAGE_UNAVAILABLE")
+            safe_elig = req_elig if req_elig in allowed_ordinary_elig else "HISTORICAL_VINTAGE_UNAVAILABLE"
+
+            req_avail = str(snapshot_meta.get("historical_availability_status") or safe_elig)
+            safe_avail = req_avail if req_avail in allowed_ordinary_elig else "HISTORICAL_VINTAGE_UNAVAILABLE"
+
+            req_auth = str(snapshot_meta.get("source_authenticity_status") or "UNVERIFIED_EXTERNAL_API")
+            safe_auth = "UNVERIFIED_CALLER_CLAIM" if req_auth == "VERIFIED_HISTORICAL_ARCHIVE" else req_auth
+
             conn.execute("""
                 INSERT INTO raw_snapshots (
                     snapshot_id, source_name, request_url, query_params, http_status,
@@ -564,21 +758,291 @@ class DatabaseManager:
                 snapshot_meta.get("http_status"),
                 snapshot_meta["ingested_at_utc"],
                 snapshot_meta["as_of_date"],
-                snapshot_meta.get("verified_first_available_at"),
+                None,  # 普通采集严禁写入已认证的历史首次公开时间
                 snapshot_meta["quality_status"],
                 snapshot_meta.get("raw_sha256"),
                 snapshot_meta.get("snapshot_path"),
                 snapshot_meta.get("processor_code_version", "v1.2-p0-data-provenance"),
-                snapshot_meta.get("historical_eligibility", "HISTORICAL_VINTAGE_UNAVAILABLE"),
+                safe_elig,
                 snapshot_meta.get("error_message"),
                 snapshot_meta.get("vintage_evidence_source"),
                 bool(snapshot_meta.get("content_integrity_verified", False)),
-                snapshot_meta.get("source_authenticity_status", "UNVERIFIED_EXTERNAL_API"),
-                snapshot_meta.get("historical_availability_status", "HISTORICAL_VINTAGE_UNAVAILABLE"),
+                safe_auth,
+                safe_avail,
             ])
         finally:
             if close_conn:
                 conn.close()
+
+    def save_historical_archive_attestation(self, att: Dict[str, Any], conn=None) -> None:
+        """持久化受控历史归档核验器签发的认证记录（不可覆盖既有认证记录）。"""
+        close_conn = False
+        if conn is None:
+            conn = self.get_connection()
+            close_conn = True
+        try:
+            conn.execute("""
+                INSERT INTO historical_archive_attestations (
+                    attestation_id, snapshot_id, archive_id, archive_source_authority,
+                    archive_file_path, archive_file_sha256, snapshot_sha256,
+                    verified_published_at, as_of_date, evidence_origin,
+                    certification_mode, is_test_only, verified_at_utc, attestation_seal
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(attestation_id) DO NOTHING;
+            """, [
+                att["attestation_id"],
+                att["snapshot_id"],
+                att["archive_id"],
+                att["archive_source_authority"],
+                att["archive_file_path"],
+                att["archive_file_sha256"],
+                att["snapshot_sha256"],
+                att["verified_published_at"],
+                att["as_of_date"],
+                att["evidence_origin"],
+                att["certification_mode"],
+                bool(att.get("is_test_only", False)),
+                att["verified_at_utc"],
+                att["attestation_seal"],
+            ])
+        finally:
+            if close_conn:
+                conn.close()
+
+    def get_historical_archive_attestation(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
+        """按 snapshot_id 查询最新受控历史归档认证记录。"""
+        df = self.query_df(
+            """
+            SELECT * FROM historical_archive_attestations
+            WHERE snapshot_id = ?
+            ORDER BY verified_at_utc DESC LIMIT 1;
+            """,
+            [str(snapshot_id)],
+        )
+        if df.empty:
+            return None
+        return df.iloc[0].to_dict()
+
+    @staticmethod
+    def _compute_feature_payload_sha256(metric: Dict[str, Any]) -> str:
+        """计算技术特征版本的规范内容摘要 SHA-256。"""
+        def _norm(v):
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return None
+            try:
+                if pd.isna(v):
+                    return None
+            except Exception:
+                pass
+            if isinstance(v, (date, datetime)):
+                return v.isoformat()
+            return v
+
+        canonical = {
+            "topic_id": _norm(metric.get("topic_id")),
+            "as_of_date": _norm(metric.get("as_of_date")),
+            "papers_count": _norm(metric.get("papers_count")),
+            "citations_count": _norm(metric.get("citations_count")),
+            "sampled_citations_count": _norm(metric.get("sampled_citations_count")),
+            "citation_count_scope": _norm(metric.get("citation_count_scope")),
+            "active_institutions": _norm(metric.get("active_institutions")),
+            "sampled_institutions_count": _norm(metric.get("sampled_institutions_count")),
+            "institution_count_scope": _norm(metric.get("institution_count_scope")),
+            "entropy_score": _norm(metric.get("entropy_score")),
+            "novelty_score": _norm(metric.get("novelty_score")),
+            "snapshot_id": _norm(metric.get("snapshot_id")),
+            "feature_lineage_json": _norm(metric.get("feature_lineage_json")),
+        }
+        raw = json.dumps(canonical, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    def append_tech_metric_version(
+        self,
+        metric: Dict[str, Any],
+        conn=None,
+        update_latest: bool = True,
+    ) -> str:
+        """不可变追加技术特征历史版本至 tech_metric_versions，并按需刷新 tech_metrics 当前最新视图。"""
+        close_conn = False
+        if conn is None:
+            conn = self.get_connection()
+            close_conn = True
+        try:
+            topic_id = str(metric["topic_id"])
+            as_of_date_val = metric["as_of_date"]
+            pub_ts = metric.get("published_at") or datetime.utcnow()
+            ing_ts = metric.get("ingested_at") or pub_ts
+            comp_ts = metric.get("feature_computed_at") or datetime.utcnow()
+            proc_ver = str(metric.get("processor_code_version") or "v1.2-p1-feature-versioning")
+
+            lineage_val = metric.get("feature_lineage_json")
+            if isinstance(lineage_val, dict):
+                lineage_json = json.dumps(lineage_val, sort_keys=True, ensure_ascii=False)
+            else:
+                lineage_json = lineage_val
+
+            src_snaps = metric.get("source_snapshot_ids")
+            if src_snaps is None:
+                src_snaps = [metric["snapshot_id"]] if metric.get("snapshot_id") else []
+            src_snaps_json = (
+                json.dumps(src_snaps, ensure_ascii=False)
+                if not isinstance(src_snaps, str)
+                else src_snaps
+            )
+
+            metric_for_hash = dict(metric)
+            metric_for_hash["feature_lineage_json"] = lineage_json
+            payload_sha = self._compute_feature_payload_sha256(metric_for_hash)
+
+            existing_cnt = conn.execute(
+                "SELECT COUNT(*) FROM tech_metric_versions WHERE topic_id = ? AND as_of_date = ?;",
+                [topic_id, as_of_date_val],
+            ).fetchone()[0]
+            seq_num = int(existing_cnt or 0) + 1
+            as_of_str = as_of_date_val.isoformat() if isinstance(as_of_date_val, (date, datetime)) else str(as_of_date_val)[:10]
+            ts_tag = comp_ts.strftime("%Y%m%dT%H%M%S") if isinstance(comp_ts, datetime) else datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+            fv_id = str(metric.get("feature_version_id") or f"tmv_{topic_id}_{as_of_str}_v{seq_num}_{ts_tag}_{payload_sha[:8]}")
+            if conn.execute("SELECT 1 FROM tech_metric_versions WHERE feature_version_id = ? LIMIT 1;", [fv_id]).fetchone():
+                fv_id = f"{fv_id}_{hashlib.sha256(f'{fv_id}:{datetime.utcnow().isoformat()}'.encode()).hexdigest()[:6]}"
+
+            # 严禁在特征版本表中直接标为 STRICT_PIT_VERIFIED
+            raw_elig = str(metric.get("historical_eligibility") or "HISTORICAL_VINTAGE_UNAVAILABLE")
+            safe_elig = (
+                "HISTORICAL_VINTAGE_UNAVAILABLE"
+                if raw_elig == "STRICT_PIT_VERIFIED"
+                else raw_elig
+            )
+
+            conn.execute("""
+                INSERT INTO tech_metric_versions (
+                    feature_version_id, topic_id, as_of_date, published_at, ingested_at,
+                    feature_computed_at, processor_code_version, feature_lineage_json,
+                    source_snapshot_ids, papers_count, citations_count, sampled_citations_count,
+                    citation_count_scope, active_institutions, sampled_institutions_count,
+                    institution_count_scope, github_stars, github_forks, commit_velocity,
+                    entropy_score, novelty_score, github_pit_eligible, snapshot_id,
+                    citations_cutoff_year, historical_eligibility, feature_payload_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, [
+                fv_id,
+                topic_id,
+                as_of_date_val,
+                pub_ts,
+                ing_ts,
+                comp_ts,
+                proc_ver,
+                lineage_json,
+                src_snaps_json,
+                metric.get("papers_count"),
+                metric.get("citations_count"),
+                metric.get("sampled_citations_count"),
+                metric.get("citation_count_scope"),
+                metric.get("active_institutions"),
+                metric.get("sampled_institutions_count"),
+                metric.get("institution_count_scope"),
+                metric.get("github_stars"),
+                metric.get("github_forks"),
+                metric.get("commit_velocity"),
+                metric.get("entropy_score"),
+                metric.get("novelty_score"),
+                bool(metric.get("github_pit_eligible", False)),
+                metric.get("snapshot_id"),
+                metric.get("citations_cutoff_year"),
+                safe_elig,
+                payload_sha,
+            ])
+
+            if update_latest:
+                conn.execute("""
+                    INSERT OR REPLACE INTO tech_metrics (
+                        topic_id, as_of_date, published_at, papers_count, citations_count,
+                        sampled_citations_count, citation_count_scope, active_institutions,
+                        sampled_institutions_count, github_stars, github_forks, commit_velocity,
+                        entropy_score, novelty_score, snapshot_id, historical_eligibility,
+                        institution_count_scope, citations_cutoff_year, feature_lineage_json,
+                        github_pit_eligible, latest_feature_version_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, [
+                    topic_id,
+                    as_of_date_val,
+                    pub_ts,
+                    metric.get("papers_count"),
+                    metric.get("citations_count"),
+                    metric.get("sampled_citations_count"),
+                    metric.get("citation_count_scope"),
+                    metric.get("active_institutions"),
+                    metric.get("sampled_institutions_count"),
+                    metric.get("github_stars"),
+                    metric.get("github_forks"),
+                    metric.get("commit_velocity"),
+                    metric.get("entropy_score"),
+                    metric.get("novelty_score"),
+                    metric.get("snapshot_id"),
+                    safe_elig,
+                    metric.get("institution_count_scope"),
+                    metric.get("citations_cutoff_year"),
+                    lineage_json,
+                    bool(metric.get("github_pit_eligible", False)),
+                    fv_id,
+                ])
+            return fv_id
+        finally:
+            if close_conn:
+                conn.close()
+
+    def get_tech_metric_versions(
+        self,
+        topic_id: str,
+        as_of_date: Optional[date] = None,
+    ) -> pd.DataFrame:
+        """按时间升序查询某技术主题(及年度)的全部不可变特征历史版本。"""
+        if as_of_date is None:
+            return self.query_df(
+                """
+                SELECT * FROM tech_metric_versions
+                WHERE topic_id = ?
+                ORDER BY as_of_date ASC, ingested_at ASC, feature_computed_at ASC;
+                """,
+                [topic_id],
+            )
+        return self.query_df(
+            """
+            SELECT * FROM tech_metric_versions
+            WHERE topic_id = ? AND as_of_date = ?
+            ORDER BY ingested_at ASC, feature_computed_at ASC;
+            """,
+            [topic_id, as_of_date],
+        )
+
+    def get_tech_metric_by_version(self, feature_version_id: str) -> Optional[Dict[str, Any]]:
+        """历史研究复现：按显式 feature_version_id 精确还原当时的技术特征版本，绝不自动切换至新版本。"""
+        df = self.query_df(
+            "SELECT * FROM tech_metric_versions WHERE feature_version_id = ? LIMIT 1;",
+            [str(feature_version_id)],
+        )
+        if df.empty:
+            return None
+        return df.iloc[0].to_dict()
+
+    def get_latest_tech_metric(
+        self,
+        topic_id: str,
+        as_of_date: Optional[date] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """当前研究查询：读取当前最新的技术特征版本记录。"""
+        if as_of_date is not None:
+            df = self.query_df(
+                "SELECT * FROM tech_metrics WHERE topic_id = ? AND as_of_date = ? LIMIT 1;",
+                [topic_id, as_of_date],
+            )
+        else:
+            df = self.query_df(
+                "SELECT * FROM tech_metrics WHERE topic_id = ? ORDER BY as_of_date DESC LIMIT 1;",
+                [topic_id],
+            )
+        if df.empty:
+            return None
+        return df.iloc[0].to_dict()
 
     def append_raw_record(self, record: Dict[str, Any], conn=None) -> str:
         """不可变追加原始采集记录至 raw_records (严禁使用 INSERT OR REPLACE 覆盖历史采集事件)。

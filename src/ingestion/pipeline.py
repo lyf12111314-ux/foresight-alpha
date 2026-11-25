@@ -233,29 +233,52 @@ class IngestionPipeline:
                         if (inst_cnt is not None and papers_cnt > 0)
                         else None
                     )
+                    lineage_dict = rec.get("feature_lineage", {})
                     lineage_json = json.dumps(
-                        rec.get("feature_lineage", {}), ensure_ascii=False, sort_keys=True
+                        lineage_dict, ensure_ascii=False, sort_keys=True
                     )
+                    source_snap_ids = sorted({
+                        sid for sid in (
+                            [rec.get("snapshot_id")]
+                            + [m.get("snapshot_id") for m in snap_metas if isinstance(m, dict)]
+                            + [
+                                entry.get("snapshot_id")
+                                for entry in lineage_dict.values()
+                                if isinstance(entry, dict)
+                            ]
+                        )
+                        if sid
+                    })
 
-                    conn.execute("""
-                        INSERT OR REPLACE INTO tech_metrics
-                        (topic_id, as_of_date, published_at, papers_count, citations_count, sampled_citations_count, citation_count_scope, active_institutions, sampled_institutions_count, github_stars, github_forks, commit_velocity, entropy_score, novelty_score, snapshot_id, historical_eligibility, institution_count_scope, citations_cutoff_year, feature_lineage_json, github_pit_eligible)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """, [
-                        topic_id, rec["as_of_date"], rec["published_at"],
-                        papers_cnt, rec.get("citations_count"),
-                        rec.get("sampled_citations_count"),
-                        rec.get("citation_count_scope"),
-                        inst_cnt,
-                        rec.get("sampled_institutions_count"),
-                        None, None, None, entropy, None,
-                        rec.get("snapshot_id"),
-                        rec.get("historical_eligibility"),
-                        rec.get("institution_count_scope"),
-                        rec.get("citations_cutoff_year"),
-                        lineage_json,
-                        False,
-                    ])
+                    db_manager.append_tech_metric_version(
+                        {
+                            "topic_id": topic_id,
+                            "as_of_date": rec["as_of_date"],
+                            "published_at": rec["published_at"],
+                            "ingested_at": prov.get("ingested_at") or rec["published_at"],
+                            "processor_code_version": getattr(self.openalex, "processor_code_version", "v1.2-p0-data-provenance"),
+                            "feature_lineage_json": lineage_json,
+                            "source_snapshot_ids": source_snap_ids,
+                            "papers_count": papers_cnt,
+                            "citations_count": rec.get("citations_count"),
+                            "sampled_citations_count": rec.get("sampled_citations_count"),
+                            "citation_count_scope": rec.get("citation_count_scope"),
+                            "active_institutions": inst_cnt,
+                            "sampled_institutions_count": rec.get("sampled_institutions_count"),
+                            "institution_count_scope": rec.get("institution_count_scope"),
+                            "github_stars": None,
+                            "github_forks": None,
+                            "commit_velocity": None,
+                            "entropy_score": entropy,
+                            "novelty_score": None,
+                            "github_pit_eligible": False,
+                            "snapshot_id": rec.get("snapshot_id"),
+                            "citations_cutoff_year": rec.get("citations_cutoff_year"),
+                            "historical_eligibility": rec.get("historical_eligibility"),
+                        },
+                        conn=conn,
+                        update_latest=True,
+                    )
                     stats["tech_metrics"] += 1
 
             if verbose:
