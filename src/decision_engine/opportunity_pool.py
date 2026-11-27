@@ -256,6 +256,8 @@ class OpportunityPoolManager:
                         if v is not None and not pd.isna(v) and str(v).strip()
                     ]
                 latest_fv_id = used_feature_version_ids[-1] if used_feature_version_ids else None
+                # 兼容直接写入旧表的数据，但不能将部分清单宣称为完整可复现输入。
+                version_manifest = used_feature_version_ids if len(used_feature_version_ids) == len(topic_metrics) else None
 
                 # 附加详情
                 synthesized["domain_id"] = domain_id
@@ -290,15 +292,17 @@ class OpportunityPoolManager:
 
                 conn.execute("""
                     INSERT INTO model_forecasts
-                    (forecast_id, target_id, target_level, model_name, model_version, as_of_data_date, prediction_created_at, horizon_years, predicted_metric, point_estimate, ci_low, ci_high, confidence_score, prediction_status, is_verified_forecast, scenarios_json, drivers_json, feature_version_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    (forecast_id, target_id, target_level, model_name, model_version, as_of_data_date, prediction_created_at, horizon_years, predicted_metric, point_estimate, ci_low, ci_high, confidence_score, prediction_status, is_verified_forecast, scenarios_json, drivers_json, feature_version_id, feature_version_ids, input_features_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """, [
                     actual_forecast_id, fc["target_id"], fc["target_level"],
                     fc["model_name"], fc["model_version"], fc["as_of_data_date"],
                     fc["prediction_created_at"], fc["horizon_years"], fc["predicted_metric"],
                     fc["point_estimate"], fc["confidence_interval_low"], fc["confidence_interval_high"],
                     fc["confidence_score"], fc["prediction_status"], fc["is_verified_forecast"],
-                    json.dumps(fc["scenarios"]), json.dumps(fc["driver_features"]), latest_fv_id
+                    json.dumps(fc["scenarios"]), json.dumps(fc["driver_features"]), latest_fv_id,
+                    json.dumps(version_manifest) if version_manifest is not None else None,
+                    json.dumps(lgbm_features, allow_nan=False)
                 ])
                 synthesized["forecast_id"] = actual_forecast_id
 

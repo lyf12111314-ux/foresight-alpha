@@ -349,7 +349,8 @@ class IngestionPipeline:
                             {
                                 "topic_id": topic_id,
                                 "as_of_date": _v(base_row.get("as_of_date")),
-                                "published_at": _v(base_row.get("published_at")) or now_ts,
+                                # 复合版本包含本次才观测的实时 GitHub 指标，不能继承旧公开时间。
+                                "published_at": max(_v(base_row.get("published_at")) or now_ts, now_ts),
                                 "ingested_at": now_ts,
                                 "feature_computed_at": now_ts,
                                 "processor_code_version": getattr(self.github, "processor_code_version", "v1.2-p1-github-versioned"),

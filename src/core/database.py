@@ -173,7 +173,9 @@ class DatabaseManager:
                     is_verified_forecast BOOLEAN DEFAULT FALSE,
                     scenarios_json JSON,
                     drivers_json JSON,
-                    feature_version_id VARCHAR
+                    feature_version_id VARCHAR,
+                    feature_version_ids JSON,
+                    input_features_json JSON
                 );
             """)
 
@@ -501,6 +503,8 @@ class DatabaseManager:
 
             for col, dtype in [
                 ("feature_version_id", "VARCHAR"),
+                ("feature_version_ids", "JSON"),
+                ("input_features_json", "JSON"),
             ]:
                 m_id = f"mig_model_forecasts_add_{col}"
                 try:
@@ -1044,6 +1048,30 @@ class DatabaseManager:
             return None
         return df.iloc[0].to_dict()
 
+    def get_forecast_tech_metrics(self, forecast_id: str) -> pd.DataFrame:
+        """按预测落库时保存的有序版本清单复现技术时序，不重新选择最新值。"""
+        forecasts = self.query_df(
+            "SELECT feature_version_ids FROM model_forecasts WHERE forecast_id = ?;",
+            [str(forecast_id)],
+        )
+        if forecasts.empty:
+            raise ValueError(f"预测记录不存在: {forecast_id}")
+        manifest = forecasts.iloc[0]["feature_version_ids"]
+        if manifest is None or pd.isna(manifest):
+            raise ValueError(f"旧预测缺少完整技术特征版本清单，无法准确复现: {forecast_id}")
+        version_ids = json.loads(manifest)
+        if not isinstance(version_ids, list) or any(not isinstance(v, str) or not v for v in version_ids):
+            raise ValueError(f"预测技术特征版本清单无效: {forecast_id}")
+        if not version_ids:
+            return self.query_df("SELECT * FROM tech_metric_versions WHERE FALSE;")
+        rows = []
+        for version_id in version_ids:
+            row = self.get_tech_metric_by_version(version_id)
+            if row is None:
+                raise RuntimeError(f"预测 {forecast_id} 关联的技术特征版本不存在: {version_id}")
+            rows.append(row)
+        return pd.DataFrame(rows)
+
     def query_tech_metrics_point_in_time(
         self,
         cutoff_date: date,
@@ -1077,7 +1105,13 @@ class DatabaseManager:
                         ORDER BY ingested_at DESC, feature_computed_at DESC
                     ) AS rn
                 FROM tech_metric_versions
-                WHERE published_at IS NOT NULL AND published_at <= ? {topic_clause}
+                WHERE published_at IS NOT NULL
+                  AND CASE
+                      WHEN (github_stars IS NOT NULL OR github_forks IS NOT NULL)
+                           AND NOT COALESCE(github_pit_eligible, FALSE)
+                      THEN GREATEST(published_at, ingested_at, feature_computed_at)
+                      ELSE published_at
+                  END <= ? {topic_clause}
             ) t
             WHERE rn = 1
             ORDER BY as_of_date ASC;
@@ -1091,6 +1125,21 @@ class DatabaseManager:
             target_col="topic_id" if topic_id is not None else None,
             target_val=topic_id,
         )
+        # 有不可变版本的年度必须只从版本表选取。否则全部版本被时间过滤后，
+        # 最新表回退会重新引入同一条未来记录。无版本的旧调用方仍可兼容读取。
+        if not tm_df.empty:
+            versioned_keys = self.query_df(
+                "SELECT DISTINCT topic_id, as_of_date FROM tech_metric_versions"
+                + (" WHERE topic_id = ?" if topic_id is not None else ""),
+                [topic_id] if topic_id is not None else None,
+            )
+            known_keys = {
+                (str(r["topic_id"]), str(r["as_of_date"])[:10])
+                for _, r in versioned_keys.iterrows()
+            }
+            tm_df = tm_df[
+                ~tm_df.apply(lambda r: (str(r["topic_id"]), str(r["as_of_date"])[:10]) in known_keys, axis=1)
+            ]
         if ver_df.empty:
             return tm_df
         if tm_df.empty:

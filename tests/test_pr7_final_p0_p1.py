@@ -9,6 +9,7 @@ import hashlib
 import json
 from datetime import date, datetime
 import duckdb
+import pytest
 
 import src.backtest.engine as bt_eng
 import src.core.database as db_module
@@ -690,4 +691,137 @@ def test_p1_g_github_enrichment_versioned_without_mutating_prior_versions(tmp_pa
     all_vers = temp_db.get_tech_metric_versions("TOPIC_EMBODIED_AI", date(2020, 12, 31))
     stars_history = [int(x) for x in all_vers["github_stars"].dropna().tolist()]
     assert 100 in stars_history and 250 in stars_history
+
+
+@pytest.mark.parametrize("with_earlier_version", [True, False])
+def test_pit_excludes_existing_backdated_github_versions(tmp_path, with_earlier_version):
+    """已落库的错误旧公开时间也不能绕过版本查询或最新表兼容回退。"""
+    db = DatabaseManager(str(tmp_path / "backdated.duckdb"))
+    base = {
+        "topic_id": "TEST_ONLY_TOPIC", "as_of_date": date(2020, 12, 31),
+        "published_at": datetime(2026, 11, 23, 12), "papers_count": 1841,
+        "github_pit_eligible": False,
+    }
+    if with_earlier_version:
+        old_id = db.append_tech_metric_version({
+            **base, "ingested_at": datetime(2026, 11, 23, 12),
+            "feature_computed_at": datetime(2026, 11, 23, 12), "github_stars": 100,
+        })
+    db.append_tech_metric_version({
+        **base, "ingested_at": datetime(2026, 11, 24, 12),
+        "feature_computed_at": datetime(2026, 11, 24, 12), "github_stars": 250,
+    })
+    result = db.query_tech_metrics_point_in_time(date(2026, 11, 23), "TEST_ONLY_TOPIC")
+    if with_earlier_version:
+        assert result.iloc[0]["feature_version_id"] == old_id
+        assert result.iloc[0]["github_stars"] == 100
+    else:
+        assert result.empty
+
+
+def test_github_pipeline_publication_covers_enrichment_time(tmp_path, monkeypatch):
+    db = _setup_isolated_db(tmp_path, monkeypatch)
+    pipe = IngestionPipeline()
+    pipe.openalex.snapshot_dir = str(tmp_path / "oa")
+    monkeypatch.setattr(pipe.macro, "collect", lambda: {})
+    monkeypatch.setattr(pipe.enterprise, "get_core_enterprise_financials", lambda: [])
+    monkeypatch.setattr(pipe.enterprise, "get_historical_distress_cohort", lambda: [])
+    monkeypatch.setattr(pipe.tech_dataset, "get_historical_tech_training_samples", lambda: [])
+    rec = _make_mock_openalex_rec(pipe, 950, datetime(2026, 11, 23, 12), "TEST_ONLY")
+    monkeypatch.setattr(pipe.openalex, "fetch_topic_research_trends",
+                        lambda q, *a, **k: [rec] if "embodied" in q.lower() else [])
+
+    class Clock(datetime):
+        current = datetime(2026, 11, 23, 15)
+
+        @classmethod
+        def utcnow(cls):
+            return cls.current
+
+    monkeypatch.setattr(ing_pipe, "datetime", Clock)
+    stars = [100]
+    monkeypatch.setattr(pipe.github, "search_repositories", lambda kw, **k: [{
+        "stars": stars[0], "forks": 10, "raw_payload": "{}",
+        "provenance": {
+            "record_id": "TEST_ONLY_GH", "source_name": "TEST_ONLY",
+            "source_url": "synthetic://test", "as_of_date": date(2026, 11, 23),
+            "published_at": Clock.current, "ingested_at": Clock.current,
+            "quality_status": "SYNTHETIC", "data_version": "TEST_ONLY",
+            "raw_hash": hashlib.sha256(b"{}").hexdigest(),
+        },
+    }] if kw == "embodied-ai" else [])
+    pipe.run_all(verbose=False)
+    Clock.current = datetime(2026, 11, 24, 15)
+    stars[0] = 250
+    pipe.run_all(verbose=False)
+    assert db.get_latest_tech_metric("TOPIC_EMBODIED_AI")["published_at"] == Clock.current
+    previous = db.query_tech_metrics_point_in_time(date(2026, 11, 23), "TOPIC_EMBODIED_AI")
+    assert previous.iloc[0]["github_stars"] == 100
+    current = db.query_tech_metrics_point_in_time(date(2026, 11, 24), "TOPIC_EMBODIED_AI")
+    assert current.iloc[0]["github_stars"] == 250
+
+
+def test_forecast_replay_retains_all_years_and_derived_inputs(tmp_path, monkeypatch):
+    db = _setup_isolated_db(tmp_path, monkeypatch)
+    for year, papers in [(2017, 100), (2018, 200), (2019, 300), (2020, 500)]:
+        db.append_tech_metric_version({
+            "topic_id": "TOPIC_SOLID_STATE_BATT", "as_of_date": date(year, 12, 31),
+            "published_at": datetime(2026, 11, 23, 12),
+            "ingested_at": datetime(2026, 11, 23, 12), "papers_count": papers,
+        })
+    manager = OpportunityPoolManager()
+    first = next(c for c in manager.build_opportunity_pool(date(2026, 11, 25))
+                 if c["topic_id"] == "TOPIC_SOLID_STATE_BATT")
+    db.append_tech_metric_version({
+        "topic_id": "TOPIC_SOLID_STATE_BATT", "as_of_date": date(2019, 12, 31),
+        "published_at": datetime(2026, 11, 24, 12),
+        "ingested_at": datetime(2026, 11, 24, 12), "papers_count": 400,
+    })
+    second = next(c for c in manager.build_opportunity_pool(date(2026, 11, 25))
+                  if c["topic_id"] == "TOPIC_SOLID_STATE_BATT")
+    assert first["feature_version_id"] == second["feature_version_id"]
+    assert first["features"]["velocity_1y"] == 200
+    assert second["features"]["velocity_1y"] == 100
+    for candidate, expected in [(first, [100, 200, 300, 500]), (second, [100, 200, 400, 500])]:
+        forecast = db.query_df("SELECT * FROM model_forecasts WHERE forecast_id = ?", [candidate["forecast_id"]]).iloc[0]
+        assert json.loads(forecast["feature_version_ids"]) == candidate["feature_version_ids"]
+        assert json.loads(forecast["input_features_json"]) == candidate["features"]
+        replay = db.get_forecast_tech_metrics(candidate["forecast_id"])
+        assert replay["papers_count"].tolist() == expected
+        assert replay["feature_version_id"].tolist() == candidate["feature_version_ids"]
+    # 重启/重复迁移后仍按原预测保存的清单复现。
+    reopened = DatabaseManager(db.db_path)
+    assert reopened.get_forecast_tech_metrics(first["forecast_id"])["papers_count"].tolist() == [100, 200, 300, 500]
+    with pytest.raises(ValueError, match="不存在"):
+        reopened.get_forecast_tech_metrics("missing")
+
+
+def test_forecast_manifest_migration_and_missing_evidence_fail_closed(tmp_path, monkeypatch):
+    db = _setup_isolated_db(tmp_path, monkeypatch)
+    candidate = OpportunityPoolManager().build_opportunity_pool(date(2026, 11, 25))[0]
+    forecast_id = candidate["forecast_id"]
+    assert db.get_forecast_tech_metrics(forecast_id).empty
+    conn = db.get_connection()
+    try:
+        conn.execute("UPDATE model_forecasts SET feature_version_ids = ? WHERE forecast_id = ?",
+                     [json.dumps(["TEST_ONLY_MISSING_VERSION"]), forecast_id])
+    finally:
+        conn.close()
+    with pytest.raises(RuntimeError, match="版本不存在"):
+        db.get_forecast_tech_metrics(forecast_id)
+    # 模拟上一提交的预测表结构，迁移保留原记录且不伪造旧预测的完整输入。
+    conn = db.get_connection()
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM model_forecasts").fetchone()[0]
+        conn.execute("ALTER TABLE model_forecasts DROP COLUMN feature_version_ids")
+        conn.execute("ALTER TABLE model_forecasts DROP COLUMN input_features_json")
+    finally:
+        conn.close()
+    for _ in range(2):
+        reopened = DatabaseManager(db.db_path)
+        rows = reopened.query_df("SELECT feature_version_ids, input_features_json FROM model_forecasts")
+        assert len(rows) == count
+        assert rows.isna().all().all()
+        with pytest.raises(ValueError, match="旧预测缺少"):
+            reopened.get_forecast_tech_metrics(forecast_id)
 
