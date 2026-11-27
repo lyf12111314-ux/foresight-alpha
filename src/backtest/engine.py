@@ -29,6 +29,7 @@ from src.core.types import (
 from src.backtest.metrics import BacktestMetricsCalculator
 from src.decision_engine.opportunity_pool import OpportunityPoolManager
 from src.diffusion.lgbm_forecaster import LightGBMGrowthForecaster
+from src.ingestion.openalex import OpenAlexCollector
 
 
 class PointInTimeBacktestEngine:
@@ -105,10 +106,28 @@ class PointInTimeBacktestEngine:
             forecaster.rejection_reason = f"历史时点 {cutoff_date.isoformat()} 尚无可获得的成熟训练样本。"
             return forecaster
 
-        # 检查特征列
-        for c in forecaster.feature_names:
-            if c not in hist_df.columns:
-                hist_df[c] = 0.0
+        # 仅在非正式实验模式下允许缺失列兼容；正式模式禁止用 0.0 填充缺失特征
+        missing_feature_cols = [c for c in forecaster.feature_names if c not in hist_df.columns]
+        if require_verified and missing_feature_cols:
+            forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+            forecaster.model_stage = ModelStage.UNTRAINED
+            forecaster.rejection_reason = (
+                f"HISTORICAL_VINTAGE_UNAVAILABLE: 正式历史模型缺少关键特征列 {missing_feature_cols}，严禁用 0.0 填补。"
+            )
+            return forecaster
+        for c in missing_feature_cols:
+            hist_df[c] = np.nan
+
+        if require_verified:
+            null_feat_mask = hist_df[forecaster.feature_names].isna().any(axis=1)
+            if null_feat_mask.any():
+                forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+                forecaster.model_stage = ModelStage.UNTRAINED
+                forecaster.rejection_reason = (
+                    "HISTORICAL_VINTAGE_UNAVAILABLE: 正式历史样本包含缺失特征值 (NULL/NaN)，"
+                    "严禁用默认常数补足正式训练。"
+                )
+                return forecaster
 
         # 分期限提取独立真实标签，严禁跨期限互相复制或替代 (P0-02 铁律)
         labels = {}
@@ -126,10 +145,77 @@ class PointInTimeBacktestEngine:
             return forecaster
 
         if require_verified:
-            provenance = [{"quality_status": "VERIFIED", "raw_hash": f"prov_hist_{i}"} for i in range(len(hist_df))]
+            # 严禁程序临时生成 {"quality_status": "VERIFIED", "raw_hash": f"prov_hist_{i}"} 伪造血缘
+            sample_ids = hist_df["sample_id"].tolist() if "sample_id" in hist_df.columns else []
+            if len(sample_ids) < len(hist_df):
+                forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+                forecaster.model_stage = ModelStage.UNTRAINED
+                forecaster.rejection_reason = "HISTORICAL_VINTAGE_UNAVAILABLE: 历史样本缺少 sample_id，无法关联真实原始血缘。"
+                return forecaster
+
+            cutoff_ts = db_manager._resolve_cutoff_ts(cutoff_date)
+            provenance = []
+            for sid in sample_ids:
+                raw_df = db_manager.query_df(
+                    "SELECT record_id, logical_record_id, ingestion_version, source_name, published_at, quality_status, raw_hash, snapshot_id "
+                    "FROM raw_records "
+                    "WHERE (logical_record_id = ? OR record_id = ?) AND published_at IS NOT NULL AND published_at <= ? "
+                    "ORDER BY ingested_at DESC, COALESCE(ingestion_version, 1) DESC LIMIT 1;",
+                    [str(sid), str(sid), cutoff_ts],
+                )
+                if raw_df.empty:
+                    forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+                    forecaster.model_stage = ModelStage.UNTRAINED
+                    forecaster.rejection_reason = (
+                        f"HISTORICAL_VINTAGE_UNAVAILABLE: 样本 {sid} 在 raw_records 中缺少截断日 {cutoff_date.isoformat()} 前真实原始记录血缘。"
+                    )
+                    return forecaster
+
+                raw_row = raw_df.iloc[0].to_dict()
+                snap_id = raw_row.get("snapshot_id")
+                if not snap_id or pd.isna(snap_id):
+                    forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+                    forecaster.model_stage = ModelStage.UNTRAINED
+                    forecaster.rejection_reason = f"HISTORICAL_VINTAGE_UNAVAILABLE: 样本 {sid} 未关联 raw_snapshots 原始快照。"
+                    return forecaster
+
+                snap_rec = db_manager.get_raw_snapshot(str(snap_id))
+                if not snap_rec:
+                    forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+                    forecaster.model_stage = ModelStage.UNTRAINED
+                    forecaster.rejection_reason = f"HISTORICAL_VINTAGE_UNAVAILABLE: 未找到快照 {snap_id} 存证。"
+                    return forecaster
+
+                elig = OpenAlexCollector.evaluate_historical_pit_eligibility(
+                    {"snapshot_id": str(snap_id)},
+                    cutoff_date=cutoff_date,
+                    db=db_manager,
+                )
+                if not elig.get("eligible"):
+                    forecaster.training_status = ModelTrainingStatus.MODEL_UNAVAILABLE_AS_OF_DATE
+                    forecaster.model_stage = ModelStage.UNTRAINED
+                    forecaster.rejection_reason = (
+                        f"HISTORICAL_VINTAGE_UNAVAILABLE: 样本 {sid} 未通过严格 PIT 快照核验 "
+                        f"({elig.get('status')}: {elig.get('reason')})。"
+                    )
+                    return forecaster
+
+                provenance.append({
+                    "record_id": raw_row.get("record_id"),
+                    "logical_record_id": raw_row.get("logical_record_id") or raw_row.get("record_id"),
+                    "ingestion_version": int(raw_row.get("ingestion_version") or 1),
+                    "quality_status": raw_row.get("quality_status"),
+                    "raw_hash": raw_row.get("raw_hash"),
+                    "snapshot_id": str(snap_id),
+                    "snapshot_path": snap_rec.get("snapshot_path"),
+                    "historical_eligibility": elig.get("status"),
+                    "vintage_evidence_source": snap_rec.get("vintage_evidence_source"),
+                })
+
             forecaster.fit_verified(
                 features=hist_df[forecaster.feature_names],
                 labels_by_horizon=labels,
+                quality_status=hist_df["quality_status"].iloc[0] if "quality_status" in hist_df.columns else "UNVERIFIED",
                 provenance_records=provenance,
                 dataset_version=f"pit_hist_verified_{cutoff_date.strftime('%Y%m%d')}"
             )
@@ -188,8 +274,8 @@ class PointInTimeBacktestEngine:
                 outcome = GroundTruthOutcome.NOT_MATURED
                 growth_actual = None
             else:
-                # 真实历史数据 (仅允许读取到 evaluation_date 的已公开数据)
-                df_hist = db_manager.query_point_in_time("tech_metrics", evaluation_date, target_col="topic_id", target_val=tid)
+                # 真实历史数据 (按 evaluation_date 从不可变特征版本表读取当时已公开的最新版本)
+                df_hist = db_manager.query_tech_metrics_point_in_time(evaluation_date, topic_id=tid)
                 if not df_hist.empty and len(df_hist) >= 2:
                     df_hist["as_of_dt"] = pd.to_datetime(df_hist["as_of_date"])
                     sub_cutoff = df_hist[df_hist["as_of_dt"] <= cutoff_dt]

@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from src.core.database import db_manager
-from src.core.types import PredictionStatus, ModelTrainingStatus, SimulationType
+from src.core.types import PredictionStatus, ModelTrainingStatus, ModelStage, SimulationType
 from src.macro.hmm_regime import MacroHMMRegimeModel
 from src.tech_discovery.inflection import InflectionDetector
 from src.diffusion.s_curve import SCurveDiffusionModel
@@ -89,18 +89,21 @@ class OpportunityPoolManager:
 
         try:
             for tid, tname, domain_id in topics:
-                # 获取该主题技术时序指标 (严禁在无数据时全表扫描泄漏未来信息)
-                topic_metrics = db_manager.query_point_in_time(
-                    "tech_metrics", cutoff_date, target_col="topic_id", target_val=tid
-                )
+                # 获取该主题截止时点可获得的不可变技术特征版本 (严禁因后续重采覆盖导致历史版本消失或前视泄露)
+                topic_metrics = db_manager.query_tech_metrics_point_in_time(cutoff_date, topic_id=tid)
 
                 # 拐点检测
                 inflection_res = self.inflection_detector.analyze_tech_acceleration(topic_metrics)
 
                 # 扩散S曲线拟合 (用于学术文献扩散拐点研判，严禁直接等同于产业/投资成长倍数)
-                if not topic_metrics.empty and len(topic_metrics) >= 4 and topic_metrics["papers_count"].iloc[-1] > 0:
-                    years = np.array([d.year if hasattr(d, "year") else int(str(d)[:4]) for d in topic_metrics["as_of_date"]])
-                    papers = topic_metrics["papers_count"].values
+                valid_scurve = (
+                    topic_metrics[pd.notna(topic_metrics["papers_count"])]
+                    if (not topic_metrics.empty and "papers_count" in topic_metrics.columns)
+                    else topic_metrics.iloc[0:0]
+                )
+                if not valid_scurve.empty and len(valid_scurve) >= 4 and float(valid_scurve["papers_count"].iloc[-1]) > 0:
+                    years = np.array([d.year if hasattr(d, "year") else int(str(d)[:4]) for d in valid_scurve["as_of_date"]])
+                    papers = valid_scurve["papers_count"].astype(float).values
                     try:
                         s_curve_res = self.diffusion_model.fit_and_forecast(years, papers, forecast_horizon_years=5)
                     except Exception:
@@ -118,20 +121,32 @@ class OpportunityPoolManager:
                         "stage_description": "历史样本不足4期或最新文献量为0，禁止虚构增长倍数"
                     }
 
-                # LightGBM 多维特征成长预测器 (使用当时实际可得指标构建，杜绝固定经验值冒充)
-                entropy_val = float(topic_metrics["entropy_score"].iloc[-1]) if (not topic_metrics.empty and "entropy_score" in topic_metrics and pd.notna(topic_metrics["entropy_score"].iloc[-1])) else 0.0
-                novelty_val = float(topic_metrics["novelty_score"].iloc[-1]) if (not topic_metrics.empty and "novelty_score" in topic_metrics and pd.notna(topic_metrics["novelty_score"].iloc[-1])) else 0.0
+                # LightGBM 多维特征成长预测器 (使用当时实际可得指标构建，缺失严格保留 None，杜绝默认值或非 PIT GitHub 泄露)
+                def _opt_float(col: str) -> Optional[float]:
+                    if topic_metrics.empty or col not in topic_metrics.columns:
+                        return None
+                    v = topic_metrics[col].iloc[-1]
+                    return None if (v is None or pd.isna(v)) else float(v)
+
+                github_mom: Optional[float] = _opt_float("github_stars")
+                if not topic_metrics.empty and "github_pit_eligible" in topic_metrics.columns:
+                    gh_elig = topic_metrics["github_pit_eligible"].iloc[-1]
+                    if cutoff_date < date.today() and (gh_elig is None or pd.isna(gh_elig) or not bool(gh_elig)):
+                        github_mom = None
 
                 lgbm_features = {
-                    "velocity_1y": float(inflection_res.get("latest_velocity_yoy", 0.0)),
-                    "acceleration": float(inflection_res.get("latest_acceleration", 0.0)),
-                    "active_institutions": float(topic_metrics["active_institutions"].iloc[-1]) if (not topic_metrics.empty and "active_institutions" in topic_metrics) else 0.0,
-                    "github_momentum": float(topic_metrics["github_stars"].iloc[-1]) if (not topic_metrics.empty and "github_stars" in topic_metrics) else 0.0,
-                    "macro_multiplier": float(latest_macro.get("macro_growth_multiplier", 1.0)),
-                    "entropy_score": entropy_val,
-                    "novelty_score": novelty_val
+                    "velocity_1y": float(inflection_res["latest_velocity_yoy"]) if (not topic_metrics.empty and inflection_res.get("latest_velocity_yoy") is not None) else None,
+                    "acceleration": float(inflection_res["latest_acceleration"]) if (not topic_metrics.empty and inflection_res.get("latest_acceleration") is not None) else None,
+                    "active_institutions": _opt_float("active_institutions"),
+                    "github_momentum": github_mom,
+                    "macro_multiplier": float(latest_macro["macro_growth_multiplier"]) if latest_macro.get("macro_growth_multiplier") is not None else None,
+                    "entropy_score": _opt_float("entropy_score"),
+                    "novelty_score": _opt_float("novelty_score"),
                 }
-                forecaster_pred = self.lgbm_forecaster.predict_growth(lgbm_features)
+                forecaster_pred = self.lgbm_forecaster.predict_growth(
+                    lgbm_features,
+                    require_complete_features=(self.lgbm_forecaster.model_stage == ModelStage.VERIFIED_PRODUCTION),
+                )
 
                 # 提取多期点估计 (若属于 UNVERIFIED_RESEARCH 实验模式，仅作为研究估计保留，绝不标记为正式已验证)
                 growth_mult = None
@@ -148,6 +163,7 @@ class OpportunityPoolManager:
 
                 diffusion_res = {
                     "status": forecaster_pred.get("status", "MODEL_NOT_TRAINED"),
+                    "is_verified": bool(forecaster_pred.get("is_verified", False)),
                     "growth_multiples": growth_multiples,
                     "current_penetration_pct": s_curve_res.get("current_penetration_pct"),
                     "stage_description": s_curve_res.get("stage_description")
@@ -231,6 +247,18 @@ class OpportunityPoolManager:
                     independent_calibration_prob=None  # 未执行独立历史校准前，强制为 None
                 )
 
+                # 关联本次预测实际使用的不可变技术特征版本标识 (P1 历史复现链路)
+                used_feature_version_ids: List[str] = []
+                if not topic_metrics.empty and "latest_feature_version_id" in topic_metrics.columns:
+                    used_feature_version_ids = [
+                        str(v)
+                        for v in topic_metrics["latest_feature_version_id"].tolist()
+                        if v is not None and not pd.isna(v) and str(v).strip()
+                    ]
+                latest_fv_id = used_feature_version_ids[-1] if used_feature_version_ids else None
+                # 兼容直接写入旧表的数据，但不能将部分清单宣称为完整可复现输入。
+                version_manifest = used_feature_version_ids if len(used_feature_version_ids) == len(topic_metrics) else None
+
                 # 附加详情
                 synthesized["domain_id"] = domain_id
                 synthesized["stage_description"] = diffusion_res.get("stage_description", "")
@@ -240,14 +268,16 @@ class OpportunityPoolManager:
                 synthesized["inflection_evidence"] = inflection_res.get("evidence", {})
                 synthesized["survival_status"] = survival_res.get("status", "INSUFFICIENT_DATA")
                 synthesized["features"] = lgbm_features
-                synthesized["feature_version"] = f"feat_{cutoff_date.strftime('%Y%m%d')}_{tid}"
+                synthesized["feature_version_id"] = latest_fv_id
+                synthesized["feature_version_ids"] = used_feature_version_ids
+                synthesized["feature_version"] = latest_fv_id or f"feat_{cutoff_date.strftime('%Y%m%d')}_{tid}"
                 synthesized["feature_published_at"] = (
                     topic_metrics["published_at"].iloc[-1]
                     if (not topic_metrics.empty and "published_at" in topic_metrics)
                     else None
                 )
 
-                # 持久化记录到 model_forecasts (不可变版本化存储，防止静默覆盖)
+                # 持久化记录到 model_forecasts (不可变版本化存储，显式绑定所用技术特征版本)
                 fc = synthesized["forecast_record"]
                 base_forecast_id = fc["forecast_id"]
                 existing_recs = conn.execute(
@@ -262,16 +292,19 @@ class OpportunityPoolManager:
 
                 conn.execute("""
                     INSERT INTO model_forecasts
-                    (forecast_id, target_id, target_level, model_name, model_version, as_of_data_date, prediction_created_at, horizon_years, predicted_metric, point_estimate, ci_low, ci_high, confidence_score, prediction_status, is_verified_forecast, scenarios_json, drivers_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    (forecast_id, target_id, target_level, model_name, model_version, as_of_data_date, prediction_created_at, horizon_years, predicted_metric, point_estimate, ci_low, ci_high, confidence_score, prediction_status, is_verified_forecast, scenarios_json, drivers_json, feature_version_id, feature_version_ids, input_features_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """, [
                     actual_forecast_id, fc["target_id"], fc["target_level"],
                     fc["model_name"], fc["model_version"], fc["as_of_data_date"],
                     fc["prediction_created_at"], fc["horizon_years"], fc["predicted_metric"],
                     fc["point_estimate"], fc["confidence_interval_low"], fc["confidence_interval_high"],
                     fc["confidence_score"], fc["prediction_status"], fc["is_verified_forecast"],
-                    json.dumps(fc["scenarios"]), json.dumps(fc["driver_features"])
+                    json.dumps(fc["scenarios"]), json.dumps(fc["driver_features"]), latest_fv_id,
+                    json.dumps(version_manifest) if version_manifest is not None else None,
+                    json.dumps(lgbm_features, allow_nan=False)
                 ])
+                synthesized["forecast_id"] = actual_forecast_id
 
                 pool_candidates.append(synthesized)
 
